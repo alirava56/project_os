@@ -192,9 +192,9 @@ test('contracts, subscriptions and revenue preserve minor units and support vers
   expect((await page.request.post('/api/records/projects/'+project.id,{headers:origin,data:{version:0,record:project}})).status()).toBe(200);
   await page.goto('/finance');
   const forms = [
-    {kind:'contracts', button:'ثبت قرارداد', title:'قرارداد محلی'},
-    {kind:'charges', button:'ثبت اشتراک دوره‌ای', title:'اشتراک محلی'},
-    {kind:'revenues', button:'ثبت درآمد', title:'درآمد محلی'},
+    {kind:'contracts', button:'ثبت قرارداد', title:'قرارداد محلی', table:'قراردادها'},
+    {kind:'charges', button:'ثبت اشتراک دوره‌ای', title:'اشتراک محلی', table:'اشتراک‌های واقعی ثبت‌شده'},
+    {kind:'revenues', button:'ثبت درآمد', title:'درآمد محلی', table:'درآمدهای واقعی ثبت‌شده'},
   ] as const;
   for (const form of forms) {
     await page.getByRole('button',{name:form.button,exact:true}).click();
@@ -215,7 +215,11 @@ test('contracts, subscriptions and revenue preserve minor units and support vers
     if (form.kind==='charges') await dialog.getByLabel('ارائه‌دهنده').fill('تأمین‌کنندهٔ ساختگی');
     await dialog.getByRole('button',{name:form.button,exact:true}).click();
     await expect(dialog).toHaveCount(0);
-    await expect(page.getByRole('cell',{name:form.title,exact:true})).toBeVisible();
+    await expect(page.getByRole('table',{name:form.table,exact:true}).getByRole('cell',{name:form.title,exact:true})).toBeVisible();
+    if (form.kind==='contracts') {
+      const reconciliation=page.getByRole('table',{name:'تطبیق قرارداد و فاکتور',exact:true});
+      await expect(reconciliation.getByRole('row').filter({hasText:form.title}).getByText('بدون فاکتور',{exact:true})).toBeVisible();
+    }
   }
   await page.reload();
   const saved=await (await page.request.get('/api/state')).json();
