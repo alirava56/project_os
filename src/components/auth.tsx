@@ -4,13 +4,14 @@ import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { ArrowLeft, Check, Eye, EyeOff, FolderKanban, Layers2, ListTodo, Server, Sparkles } from 'lucide-react';
 import { newId, projectHref, today } from '@/lib/format';
-import { savePreferences, useDemo } from '@/lib/store';
+import { savePreferences, useDemo, useWorkspaceReady } from '@/lib/store';
 import type { Project, Task } from '@/lib/types';
 import { SelectOptions } from './forms';
 import { Mark } from './shell';
 import { Art, Button, Callout, Field, Heading, IconButton, Panel, Pill, Row, formValues } from './ui';
 
 export function Login() {
+  const ready=useWorkspaceReady();
   const [passwordVisible,setPasswordVisible]=useState(false);
   const [useRecovery,setUseRecovery]=useState(false);
   const [busy,setBusy]=useState(false);
@@ -27,7 +28,7 @@ export function Login() {
   return <main className="auth-layout"><div className="auth-form"><div className="auth-form-inner">
     <div className="flex items-center justify-between"><Mark /><Pill dot>فضای کاری خصوصی</Pill></div>
     <Heading title="ورود به فضای کاری" subtitle="دسترسی فقط با حساب ایجادشده در راه‌اندازی اولیه امکان‌پذیر است." />
-    <form onSubmit={signIn} className="form-stack">
+    <form method="post" onSubmit={signIn} className="form-stack">
       <Field label="ایمیل"><input name="email" type="email" dir="ltr" autoComplete="username" required /></Field>
       <div className="password-field"><Field label="رمز عبور"><input name="password" type={passwordVisible?'text':'password'} autoComplete="current-password" dir="ltr" required /></Field>
         <IconButton icon={passwordVisible?EyeOff:Eye} label="نمایش یا پنهان‌کردن رمز" onClick={()=>setPasswordVisible(!passwordVisible)}/></div>
@@ -36,7 +37,7 @@ export function Login() {
         <Field label="کد تأیید دومرحله‌ای (در صورت فعال‌بودن)"><input name="totp" type="text" inputMode="numeric" pattern="[0-9]{6}" maxLength={6} dir="ltr" autoComplete="one-time-code" placeholder="123456" /></Field>}
       <label className="check-row"><input type="checkbox" checked={useRecovery} onChange={e=>setUseRecovery(e.target.checked)} />استفاده از کد بازیابی به‌جای Authenticator</label>
       {error&&<p role="alert" className="form-error">{error}</p>}
-      <Button type="submit" variant="primary" icon={ArrowLeft} disabled={busy}>{busy?'در حال ورود…':'ورود امن'}</Button>
+      <Button type="submit" variant="primary" icon={ArrowLeft} disabled={!ready || busy}>{busy?'در حال ورود…':'ورود امن'}</Button>
     </form>
     <p className="muted auth-join">اگر هنوز حسابی ثبت نشده، <Link href="/setup" className="cell-link">راه‌اندازی مالک اولیه</Link> را انجام دهید.</p>
     <p className="muted">کدهای بازیابی فقط هنگام فعال‌سازی ورود دومرحله‌ای نمایش داده می‌شوند. برای بازیابی بدون رمز عبور یا بازیابی حسابِ بدون کد، فرایند خودکار وجود ندارد.</p>

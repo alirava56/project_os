@@ -14,6 +14,21 @@ async function signIn(page: Page, address: string, secret: string) {
   await page.getByRole('button', {name:'ورود امن',exact:true}).click();
 }
 
+test('credential forms fail closed before client JavaScript starts', async ({browser,appURL}) => {
+  const context=await browser.newContext({
+    baseURL:appURL,ignoreHTTPSErrors:appURL.startsWith('https:'),javaScriptEnabled:false,
+  });
+  try {
+    const page=await context.newPage();
+    for (const route of ['/login','/setup','/join']) {
+      expect((await page.goto(route))?.status()).toBe(200);
+      const form=page.locator('form');
+      await expect(form).toHaveAttribute('method','post');
+      await expect(form.locator('button[type=submit]')).toBeDisabled();
+    }
+  } finally { await context.close(); }
+});
+
 test('bootstrap, failed sign-in, session expiry, rate limit and account menu logout', async ({page,origin,postgresFixture}) => {
   if (!postgresFixture) throw new Error('This scenario requires PostgreSQL');
   const {rows:schema} = await postgresFixture.query<{id:string}>('SELECT id FROM projectos_schema_migrations ORDER BY id');
