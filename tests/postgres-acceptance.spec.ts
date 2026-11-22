@@ -44,7 +44,7 @@ test('bootstrap, failed sign-in, session expiry, rate limit and account menu log
   await page.getByLabel('نام فضای کاری').fill(workspace);
   await page.getByLabel(/رمز قدرتمند/).fill(password);
   await page.getByRole('button',{name:'ایجاد فضای کاری امن'}).click();
-  await expect(page.getByRole('alert')).toBeVisible();
+  await expect(page.locator('form').getByRole('alert')).toContainText('توکن راه‌اندازی یا اطلاعات حساب معتبر نیست');
   await page.getByLabel('توکن راه‌اندازی').fill(setupToken);
   await page.getByRole('button',{name:'ایجاد فضای کاری امن'}).click();
   await expect(page).toHaveURL(/\/onboarding$/);
@@ -56,7 +56,7 @@ test('bootstrap, failed sign-in, session expiry, rate limit and account menu log
   await expect(page).toHaveURL(/\/login$/);
   expect((await page.request.get('/api/state')).status()).toBe(401);
   await signIn(page,email,'incorrect-synthetic-password');
-  await expect(page.getByRole('alert')).toBeVisible();
+  await expect(page.locator('form').getByRole('alert')).toContainText('ایمیل یا رمز معتبر نیست');
   await signIn(page,email,password);
   await expect(page).toHaveURL(/\/dashboard$/);
   const expired = Date.now() - 1;
