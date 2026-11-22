@@ -571,8 +571,12 @@ test('owners can attach Vault metadata to a VPS and other roles cannot retrieve 
   } finally { await member.dispose(); }
 });
 
-test('workspace overlay triggers become available when browser scripts are ready', async ({page, origin}) => {
+test('workspace overlay and project archive become available when browser scripts are ready', async ({page, origin}) => {
   await bootstrap(page.request, origin);
+  const fixtureId='project-hydration-fixture';
+  expect((await page.request.post('/api/records/projects/'+fixtureId,{headers:origin,data:{
+    version:0,record:project(fixtureId),
+  }})).status()).toBe(200);
   let releaseScripts!: () => void;
   const ready = new Promise<void>(resolve => { releaseScripts = resolve; });
   await page.route(/\/_next\/static\/.*\.js(?:\?.*)?$/, async route => {
@@ -580,13 +584,19 @@ test('workspace overlay triggers become available when browser scripts are ready
     await route.continue();
   });
   const account = page.getByRole('button', {name:'حساب کاربری', exact:true});
+  const archive = page.getByRole('button', {name:'بایگانی پروژه', exact:true});
   try {
-    await page.goto('/dashboard', {waitUntil:'commit'});
+    await page.goto('/projects/'+fixtureId, {waitUntil:'commit'});
     await expect(account).toBeDisabled();
+    await expect(archive).toBeDisabled();
   } finally { releaseScripts(); }
   await expect(account).toBeEnabled();
   await account.click();
   await expect(page.getByRole('dialog', {name:'حساب کاربری'})).toBeVisible();
+  await page.keyboard.press('Escape');
+  await expect(archive).toBeEnabled();
+  await archive.click();
+  await expect(page.getByRole('dialog', {name:'بایگانی پروژه'})).toBeVisible();
 });
 
 test('alerts preserve independent snoozed, dismissed and resolved states after saving', async ({page, origin}) => {
