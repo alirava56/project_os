@@ -13,7 +13,7 @@ BEGIN
     AND NOT EXISTS (SELECT 1 FROM pg_auth_members WHERE member=r.oid)
     AND NOT EXISTS (SELECT 1 FROM pg_class WHERE relowner=r.oid)
     AND NOT has_schema_privilege(r.oid,'public','CREATE')
-    AND NOT has_table_privilege(r.oid,'public.users','SELECT')
+    AND NOT has_column_privilege(r.oid,'public.users','email','SELECT')
     AND NOT has_table_privilege(r.oid,'public.monitor_observations','SELECT')
     AND NOT has_column_privilege(r.oid,'public.notification_outbox','delivered_at','UPDATE');
   IF target_oid IS NULL THEN RAISE EXCEPTION 'Expected a dedicated reminder login'; END IF;

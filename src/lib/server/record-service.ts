@@ -1,7 +1,7 @@
 import { isRecordKind, validRecordId, type RecordChange, type RecordKind, type WorkspaceRecord } from '../record-contract';
 import type { DemoData } from '../types';
 import {
-  canSeeProject, ForbiddenError, lockWorkspace, persistChanges, projectOf, projectPolicy, storedRecord,
+  canSeeProject, ForbiddenError, lockWorkspace, persistChanges, projectOf, projectPolicy, recordReadTable, storedRecord,
   transaction, VersionConflictError, type Account, type PreparedChange, type RecordRow, type SqlExecutor,
 } from './db';
 import { parsePreferences, parseRecord, validateGraph, ValidationError } from './validation';
@@ -38,7 +38,7 @@ async function validateRelations(db: SqlExecutor, workspaceId: string, changes: 
 
   const removedProjects = new Set(updates.filter(change => change.kind === 'projects' && !change.record).map(change => change.id));
   for (const projectId of removedProjects) {
-    const children = await db.all<RecordRow>(`SELECT kind,id,project_id,payload,record_version FROM records
+    const children = await db.all<RecordRow>(`SELECT kind,id,project_id,payload,record_version FROM ${recordReadTable(db)}
       WHERE workspace_id=? AND project_id=? AND kind<>'projects'`, workspaceId, projectId);
     for (const row of children) {
       const draft = changes.get(key(row.kind as RecordKind, row.id));
@@ -49,7 +49,7 @@ async function validateRelations(db: SqlExecutor, workspaceId: string, changes: 
   }
 
   async function graphRows<Kind extends 'tasks' | 'resources' | 'charges' | 'secrets'>(kind: Kind) {
-    const rows = await db.all<RecordRow>('SELECT kind,id,project_id,payload,record_version FROM records WHERE workspace_id=? AND kind=?',
+    const rows = await db.all<RecordRow>(`SELECT kind,id,project_id,payload,record_version FROM ${recordReadTable(db)} WHERE workspace_id=? AND kind=?`,
       workspaceId, kind);
     type Item = DemoData[Kind][number];
     const effective = new Map<string, Item>(rows.map(row => [row.id, decode(row) as Item]));
@@ -131,9 +131,11 @@ export async function commitRecordChanges(
       if (action !== 'create' && !previous) throw new MissingRecordError();
       if (previous && previous.record_version > expectedVersion) throw new VersionConflictError();
       if (!previous) {
-        const tombstone = await db.one<{record_version: number}>('SELECT record_version FROM record_tombstones WHERE workspace_id=? AND kind=? AND id=?',
-          account.workspaceId, kind, id);
-        if (tombstone && tombstone.record_version > expectedVersion) throw new VersionConflictError();
+        const stale = db.scopeIdentity
+          ? (await db.one<{stale:boolean}>('SELECT public.projectos_check_record_tombstone(?,?,?) AS stale',kind,id,expectedVersion))?.stale
+          : await db.one('SELECT id FROM record_tombstones WHERE workspace_id=? AND kind=? AND id=? AND record_version>?',
+            account.workspaceId,kind,id,expectedVersion);
+        if (stale) throw new VersionConflictError();
       }
       const record = action === 'delete' ? undefined : parseRecord(kind, change.record);
       if (record && record.id !== id) throw new ValidationError('Record id mismatch');
@@ -142,11 +144,11 @@ export async function commitRecordChanges(
       // Keep those edges intact and reject any new dependency outside the editor's grant.
       if (record && kind === 'tasks' && policy.projectIds !== null) {
         const task = record as DemoData['tasks'][number];
-        const old = previous ? decode(previous) as DemoData['tasks'][number] : undefined;
+        const old = previous && !privateTaskGraph ? decode(previous) as DemoData['tasks'][number] : undefined;
         const hidden: string[] = [];
         for (const id of old?.dependencies ?? []) {
           const row = await storedRecord(db, account.workspaceId, 'tasks', id);
-          if ((privateTaskGraph && !row) || (row && !canSeeProject(policy, row.project_id))) hidden.push(id);
+          if (row && !canSeeProject(policy, row.project_id)) hidden.push(id);
         }
         for (const id of task.dependencies) {
           const row = await storedRecord(db, account.workspaceId, 'tasks', id);

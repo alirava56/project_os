@@ -12,7 +12,8 @@ BEGIN
       AND NOT EXISTS (SELECT 1 FROM pg_auth_members WHERE member=r.oid)
       AND NOT has_schema_privilege(r.oid,'public','CREATE')
       AND NOT EXISTS (SELECT 1 FROM pg_class WHERE relowner=r.oid)
-      AND NOT has_table_privilege(r.oid,'public.records','SELECT')
+      AND NOT has_column_privilege(r.oid,'public.records','payload','SELECT')
+      AND NOT has_column_privilege(r.oid,'public.users','email','SELECT')
   ) OR NOT EXISTS (SELECT 1 FROM public.workspaces WHERE id=workspace) THEN
     RAISE EXCEPTION 'Expected a new dedicated delivery login and existing workspace';
   END IF;

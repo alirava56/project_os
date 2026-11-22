@@ -30,6 +30,8 @@ psql "service=projectos_staging_migrator" -X -v runtime_role=projectos_app -f sc
 
 پس از Migration 009 و پیش از فعال‌کردن حساب وب، کلید تصادفی ۳۲ بایتی مستقل را به‌شکل ۶۴ رقم هگز در Secret Manager قرار دهید. با اتصال مالک schema و همین مقدار در `PROJECTOS_DB_SCOPE_KEY`، فرمان `node scripts/provision-db-scope.mjs` را اجرا کنید. همان مقدار را به محیط وب بدهید. کلید در Backup قرار نمی‌گیرد. پس از Restore آن را دوباره Provision کنید. نصب Migration و چرخش کلید را در پنجرهٔ توقف نوشتن انجام دهید.
 
+در Cutover برای فرایندهای وب و Worker مقدار `PROJECTOS_DATABASE_MODE=postgres` را فعال کنید. سلامت وب در این حالت، مجوز حساب عملیاتی و تطبیق کلید امضای Scope را هم بررسی می‌کند. حساب Migration فقط برای فرمان‌های نصب و نگهداری استفاده می‌شود. Workerها باید با Workspace و حساب اختصاصی خود شروع شوند.
+
 برای ارسال اعلان، برای هر Workspace یک نقش ورود جدید بسازید و از حساب مهاجرت برای اجرای فرمان زیر استفاده کنید. اتصال آن نقش را فقط به فرایند `npm run notifications:deliver` بدهید.
 
 ```shell

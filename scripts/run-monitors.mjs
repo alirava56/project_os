@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { createHash } from 'node:crypto';
-import { closeDatabase, lockWorkspace, sql, transaction } from './database.mjs';
+import { closeDatabase, lockWorkspace, requireWorkerWorkspace, sql, transaction } from './database.mjs';
 import { probeHttps } from './monitor-probe.mjs';
 
 const hosts = new Set((process.env.PROJECTOS_MONITOR_HOSTS ?? '').split(',').map(host => host.trim().toLowerCase()).filter(Boolean));
@@ -8,6 +8,7 @@ const workspace = process.env.PROJECTOS_MONITOR_WORKSPACE;
 
 async function run() {
   if (!hosts.size || !workspace) throw new Error('Monitoring workspace and HTTPS hosts are required');
+  await requireWorkerWorkspace('monitor',workspace);
   const rows = await sql.all("SELECT id,payload FROM records WHERE kind='resources' AND workspace_id=? ORDER BY id", workspace);
   const candidates = rows.filter(row => {
     try { return hosts.has(new URL(JSON.parse(row.payload).address).hostname.toLowerCase()); }

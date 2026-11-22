@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { timingSafeEqual } from 'node:crypto';
 import { validRecordId } from '@/lib/record-contract';
 import { hash, rateLimit, readLimitedJson } from '@/lib/server/auth';
-import { storedRecord, transaction } from '@/lib/server/db';
+import { requireWebRuntime, storedRecord, transaction } from '@/lib/server/db';
 import { apiError, jsonError, noStore } from '@/lib/server/http';
 
 export const runtime = 'nodejs';
@@ -14,6 +14,7 @@ export async function POST(request: NextRequest) {
   if (!key || key.length < 32 || !workspace || !approved.size) return apiError('Agent ingestion not configured',503);
   const credential = request.headers.get('authorization') ?? '';
   if (!timingSafeEqual(Buffer.from(hash(credential),'hex'),Buffer.from(hash('Bearer '+key),'hex'))) return apiError('Unauthenticated',401);
+  await requireWebRuntime();
   const limit = await rateLimit('monitor:agent',workspace,120,60_000);
   if (!limit.allowed) return apiError('Try again later',429,{'Retry-After':String(limit.retryAfter)});
   let input: unknown;

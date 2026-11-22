@@ -2,8 +2,9 @@ import { createHash, randomBytes, randomUUID, scrypt, timingSafeEqual } from 'no
 import { isIP } from 'node:net';
 import { cookies } from 'next/headers';
 import type { NextRequest } from 'next/server';
-import { lockBootstrap } from '../../../scripts/database.mjs';
-import { accountByUser, ForbiddenError, sql, transaction, userCount, type Account, type SqlExecutor } from './db';
+import { lockBootstrap, requireWebRuntime } from '../../../scripts/database.mjs';
+import { accountByUser, ForbiddenError, readTransaction, sql, transaction, userCount, type Account, type SqlExecutor } from './db';
+import { mfaEnabled } from './mfa';
 import { redactCredentials, suspiciousCredential } from './credential-guard';
 
 export const COOKIE = process.env.NODE_ENV === 'production' ? '__Host-projectos_session' : 'projectos_session';
@@ -79,13 +80,17 @@ export async function setupOwner(input: {setupToken: unknown; email: unknown; pa
   const displayName = safeDisplayLabel(input.displayName);
   const workspace = safeDisplayLabel(input.workspace);
   if (!email || !validatePassword(password) || !displayName || !workspace) throw new Error('INVALID_INPUT');
+  await requireWebRuntime();
   const salt = randomBytes(24).toString('hex');
   const digest = await passwordHash(password, salt);
   return transaction(async db => {
     await lockBootstrap(db);
-    const exists = await db.one('SELECT id FROM users LIMIT 1');
+    const exists = db.dialect === 'postgres'
+      ? !(await db.one<{open:boolean}>('SELECT public.projectos_setup_open() AS open'))?.open
+      : await db.one('SELECT id FROM users LIMIT 1');
     if (exists) throw new Error('SETUP_CLOSED');
     const id = randomUUID(), workspaceId = randomUUID(), now = new Date().toISOString();
+    await db.scopeIdentity?.({purpose:'bootstrap',userId:id,workspaceId});
     await db.run('INSERT INTO users(id,email,display_name,password_hash,salt,created_at) VALUES(?,?,?,?,?,?)',
       id, email, displayName, digest, salt, now);
     await db.run('INSERT INTO workspaces(id,name,created_at) VALUES(?,?,?)', workspaceId, workspace, now);
@@ -97,33 +102,42 @@ export async function setupOwner(input: {setupToken: unknown; email: unknown; pa
 export async function authenticate(email: unknown, password: unknown) {
   if (typeof password !== 'string' || password.length > 128) return null;
   const normalized = normalizeEmail(email);
-  const row = await sql.one<{id: string; password_hash: string; salt: string}>(
-    'SELECT id,password_hash,salt FROM users WHERE email=?', normalized ?? '',
-  );
+  const row = await readTransaction(async db => {
+    await db.scopeIdentity?.({purpose:'login',email:normalized ?? ''});
+    type Credentials = {id: string; password_hash: string; salt: string};
+    return db.scopeIdentity
+      ? db.one<Credentials>('SELECT id,password_hash,salt FROM public.projectos_password_credentials()')
+      : db.one<Credentials>('SELECT id,password_hash,salt FROM users WHERE email=?', normalized ?? '');
+  });
   const candidate = await passwordHash(password, row?.salt ?? '00'.repeat(24));
   const expected = Buffer.from(row?.password_hash ?? '00'.repeat(64), 'hex');
   const matches = expected.length === 64 && timingSafeEqual(Buffer.from(candidate, 'hex'), expected);
-  if (row) {
-    if (matches) await sql.run('UPDATE users SET failed_logins=0,locked_until=0 WHERE id=? AND (failed_logins<>0 OR locked_until<>0)', row.id);
-    else await sql.run('UPDATE users SET failed_logins=CASE WHEN failed_logins<1000 THEN failed_logins+1 ELSE failed_logins END WHERE id=?', row.id);
-  }
+  if (row) await transaction(async db => {
+    await db.scopeIdentity?.({purpose:'login',email:normalized ?? ''});
+    if (matches) await db.run('UPDATE users SET failed_logins=0,locked_until=0 WHERE id=? AND (failed_logins<>0 OR locked_until<>0)', row.id);
+    else await db.run('UPDATE users SET failed_logins=CASE WHEN failed_logins<1000 THEN failed_logins+1 ELSE failed_logins END WHERE id=?', row.id);
+  });
   return matches && row ? row.id : null;
 }
 
 export async function rateLimit(
   scope: string, bucket: string, limit: number, windowMs: number, timestamp = Date.now(), db = sql,
-) {
+): Promise<{allowed:boolean; retryAfter:number}> {
+  if (db === sql) return transaction(connection => rateLimit(scope,bucket,limit,windowMs,timestamp,connection));
+  const bucketHash = hash(bucket);
+  await db.scopeIdentity?.({purpose:'rate',scope,bucket:bucketHash});
   const expiresAt = Math.floor(timestamp / windowMs) * windowMs + windowMs;
   const row = await db.one<{hits: number}>(`INSERT INTO auth_rate_limits(scope,bucket,expires_at,hits) VALUES(?,?,?,1)
     ON CONFLICT(scope,bucket) DO UPDATE SET
       hits=CASE WHEN auth_rate_limits.expires_at<>excluded.expires_at THEN 1
         WHEN auth_rate_limits.hits<? THEN auth_rate_limits.hits+1 ELSE auth_rate_limits.hits END,
       expires_at=excluded.expires_at
-    RETURNING hits`, scope, hash(bucket), expiresAt, limit + 1);
+    RETURNING hits`, scope, bucketHash, expiresAt, limit + 1);
   return { allowed: (row?.hits ?? limit + 1) <= limit, retryAfter: Math.max(1, Math.ceil((expiresAt - timestamp) / 1000)) };
 }
 
 export async function authRate(request: NextRequest, scope: string) {
+  await requireWebRuntime();
   const source = request.headers.get('x-projectos-client-ip');
   const proxyConfigured = process.env.PROJECTOS_TRUST_CLIENT_IP === 'enabled';
   if (proxyConfigured && (!source || !isIP(source))) return { allowed: false, retryAfter: 60 };
@@ -134,6 +148,7 @@ export async function authRate(request: NextRequest, scope: string) {
 
 export async function newSession(userId: string, db?: SqlExecutor): Promise<string> {
   if (!db) return transaction(connection => newSession(userId, connection));
+  await db.scopeIdentity?.({purpose:'mfa',userId});
   if (!await accountByUser(userId, db)) throw new ForbiddenError();
   const token = randomBytes(32).toString('base64url');
   const now = Date.now();
@@ -159,16 +174,21 @@ export async function lookupSessionUserId(token: string): Promise<string | null>
   if (!/^[A-Za-z0-9_-]{43}$/.test(token)) return null;
   const now = Date.now();
   const tokenHash = hash(token);
-  const row = await sql.one<{id: string; lastSeen: number}>(`SELECT s.user_id AS id,s.last_seen_at AS "lastSeen"
-    FROM sessions s JOIN memberships m ON m.user_id=s.user_id
-    WHERE s.token_hash=? AND s.expires_at>? AND s.last_seen_at>?`, tokenHash, now, now - SESSION_IDLE_MS);
-  if (!row) return null;
-  if (now - row.lastSeen > 60_000) await sql.run('UPDATE sessions SET last_seen_at=? WHERE token_hash=? AND last_seen_at<?',
-    now, tokenHash, now - 60_000);
-  return row.id;
+  return transaction(async db => {
+    await db.scopeIdentity?.({purpose:'session',digest:tokenHash});
+    if (db.scopeIdentity) return (await db.one<{id:string|null}>(
+      'SELECT public.projectos_session_user(?,?) AS id',now,now-SESSION_IDLE_MS))?.id ?? null;
+    const row = await db.one<{id: string; lastSeen: number}>(`SELECT s.user_id AS id,s.last_seen_at AS "lastSeen"
+      FROM sessions s WHERE s.token_hash=? AND s.expires_at>? AND s.last_seen_at>?`, tokenHash, now, now - SESSION_IDLE_MS);
+    if (!row) return null;
+    if (now - row.lastSeen > 60_000) await db.run('UPDATE sessions SET last_seen_at=? WHERE token_hash=? AND last_seen_at<?',
+      now, tokenHash, now - 60_000);
+    return row.id;
+  });
 }
 
 export async function getSessionAccount(): Promise<Account | null> {
+  await requireWebRuntime();
   const token = await readSessionToken();
   const id = token ? await lookupSessionUserId(token) : null;
   if (!id) return null;
@@ -179,15 +199,29 @@ export async function getSessionAccount(): Promise<Account | null> {
 export async function getCurrentAccount(): Promise<Account | null> {
   const account = await getSessionAccount();
   if (!account) return null;
-  if (requireMfa() && !await sql.one('SELECT id FROM users WHERE id=? AND mfa_seed IS NOT NULL', account.id)) return null;
+  if (requireMfa() && !await mfaEnabled(account.id)) return null;
   return account;
 }
 
 export async function signOut() {
+  await requireWebRuntime();
   const jar = await cookies();
   const token = jar.get(COOKIE)?.value;
-  if (token) await sql.run('DELETE FROM sessions WHERE token_hash=?', hash(token));
+  if (token) await transaction(async db => {
+    const digest = hash(token);
+    await db.scopeIdentity?.({purpose:'session',digest});
+    if (db.scopeIdentity) await db.one('SELECT public.projectos_end_session()');
+    else await db.run('DELETE FROM sessions WHERE token_hash=?', digest);
+  });
   jar.set(COOKIE, '', { httpOnly: true, secure: process.env.NODE_ENV === 'production', sameSite: 'strict', path: '/', maxAge: 0 });
+}
+
+export async function sessionActive(db:SqlExecutor,userId:string,digest:string) {
+  const now = Date.now();
+  if (db.scopeIdentity) return (await db.one<{active:boolean}>(
+    'SELECT public.projectos_session_active(?,?,?) AS active',digest,now,now-SESSION_IDLE_MS))?.active === true;
+  return Boolean(await db.one('SELECT 1 FROM sessions WHERE token_hash=? AND user_id=? AND expires_at>? AND last_seen_at>?',
+    digest,userId,now,now-SESSION_IDLE_MS));
 }
 
 export { userCount };

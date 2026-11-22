@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { authenticate, checkOrigin, getCurrentAccount, hash, rateLimit, readLimitedJson, readSessionToken, SESSION_IDLE_MS, signOut } from '@/lib/server/auth';
-import { sql, transaction } from '@/lib/server/db';
+import { authenticate, checkOrigin, getCurrentAccount, hash, rateLimit, readLimitedJson, readSessionToken, sessionActive, SESSION_IDLE_MS, signOut } from '@/lib/server/auth';
+import { readTransaction, transaction } from '@/lib/server/db';
 import { apiError, jsonError, noStore } from '@/lib/server/http';
 import { lockIdentity, mfaEnabled, verifyMfa } from '@/lib/server/mfa';
 
@@ -13,15 +13,18 @@ export async function GET() {
   const token = await readSessionToken();
   if (!account || !token) return apiError('Unauthenticated', 401);
   const now = Date.now();
-  const rows = await sql.all<{token_hash: string; createdAt: number; expiresAt: number; lastSeenAt: number}>(
-    `SELECT token_hash,created_at AS "createdAt",expires_at AS "expiresAt",last_seen_at AS "lastSeenAt"
-      FROM sessions WHERE user_id=? AND expires_at>? AND last_seen_at>? ORDER BY created_at DESC`,
-    account.id, now, now - SESSION_IDLE_MS,
-  );
   const current = hash(token);
-  const sessions = rows.map(({token_hash, ...metadata}) => ({
-    ...metadata, id: reference(token_hash), current: token_hash === current,
-  }));
+  type Session = {id:string; current:boolean; createdAt:number; expiresAt:number; lastSeenAt:number};
+  const sessions = await readTransaction(async db => {
+    await db.scopeIdentity?.({purpose:'session-list',userId:account.id});
+    if (db.scopeIdentity) return db.all<Session>('SELECT * FROM public.projectos_list_sessions(?,?,?)',current,now,now-SESSION_IDLE_MS);
+    const rows = await db.all<Omit<Session,'id'|'current'> & {token_hash:string}>(
+      `SELECT token_hash,created_at AS "createdAt",expires_at AS "expiresAt",last_seen_at AS "lastSeenAt"
+        FROM sessions WHERE user_id=? AND expires_at>? AND last_seen_at>? ORDER BY created_at DESC`,
+      account.id, now, now - SESSION_IDLE_MS,
+    );
+    return rows.map(({token_hash,...metadata}) => ({...metadata,id:reference(token_hash),current:token_hash===current}));
+  });
   return NextResponse.json({ sessions, count: sessions.length }, { headers: noStore });
 }
 
@@ -42,8 +45,14 @@ export async function POST(request: NextRequest) {
   const current = hash(token);
   const result = await transaction(async db => {
     await lockIdentity(db, account.id);
-    if (!await db.one('SELECT token_hash FROM sessions WHERE user_id=? AND token_hash=?', account.id, current)) return { status: 401 as const };
+    if (!await sessionActive(db,account.id,current)) return { status: 401 as const };
     if (await mfaEnabled(account.id, db) && !await verifyMfa(account.id, totp, db)) return { status: 403 as const };
+    if (db.scopeIdentity) {
+      const result = await db.one<{revoked:number; signedOut:boolean}>(
+        'SELECT * FROM public.projectos_revoke_sessions(?,?,?)',current,action,typeof sessionId==='string' ? sessionId : null);
+      if (!result || (action==='revokeOne' && !result.revoked)) return {status:404 as const};
+      return {status:200 as const,...result};
+    }
     if (action === 'revokeOne') {
       const sessions = await db.all<{token_hash: string}>('SELECT token_hash FROM sessions WHERE user_id=?', account.id);
       const target = sessions.find(session => reference(session.token_hash) === sessionId);

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { closeDatabase } from './database.mjs';
+import { closeDatabase, requireWorkerWorkspace } from './database.mjs';
 import { configuredChannels, deliverNotifications } from './notification-delivery.mjs';
 
 try {
@@ -8,6 +8,7 @@ try {
     console.error('No notification channels or workspace configured');
     process.exitCode = 2;
   } else {
+    await requireWorkerWorkspace('delivery',process.env.PROJECTOS_NOTIFICATION_WORKSPACE);
     console.log(JSON.stringify(await deliverNotifications(process.env.PROJECTOS_NOTIFICATION_WORKSPACE, channels)));
   }
 } catch (error) {

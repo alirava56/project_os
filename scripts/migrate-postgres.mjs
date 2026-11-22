@@ -19,6 +19,10 @@ const migrations = [
   ['015_private_task_graph', new URL('../schema/postgres/015_private_task_graph.sql', import.meta.url)],
   ['016_audit_project_rls', new URL('../schema/postgres/016_audit_project_rls.sql', import.meta.url)],
   ['017_integration_rls', new URL('../schema/postgres/017_integration_rls.sql', import.meta.url)],
+  ['018_identity_boundaries', new URL('../schema/postgres/018_identity_boundaries.sql', import.meta.url)],
+  ['019_live_workspace_scope', new URL('../schema/postgres/019_live_workspace_scope.sql', import.meta.url)],
+  ['020_record_projection', new URL('../schema/postgres/020_record_projection.sql', import.meta.url)],
+  ['021_private_role_boundaries', new URL('../schema/postgres/021_private_role_boundaries.sql', import.meta.url)],
 ];
 const client = await getPostgresPool().connect();
 try {

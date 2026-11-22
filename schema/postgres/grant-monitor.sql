@@ -13,7 +13,7 @@ BEGIN
     AND NOT EXISTS (SELECT 1 FROM pg_auth_members WHERE member=r.oid)
     AND NOT EXISTS (SELECT 1 FROM pg_class WHERE relowner=r.oid)
     AND NOT has_schema_privilege(r.oid,'public','CREATE')
-    AND NOT has_table_privilege(r.oid,'public.users','SELECT')
+    AND NOT has_column_privilege(r.oid,'public.users','email','SELECT')
     AND NOT has_table_privilege(r.oid,'public.notification_outbox','SELECT');
   IF target_oid IS NULL THEN RAISE EXCEPTION 'Expected a dedicated monitor login'; END IF;
   INSERT INTO projectos_private.monitor_logins(login,workspace_id) VALUES(target_oid,workspace)

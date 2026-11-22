@@ -1,5 +1,5 @@
 import { DatabaseSync } from 'node:sqlite';
-import { chmodSync, existsSync, lstatSync, mkdirSync, realpathSync } from 'node:fs';
+import { chmodSync, closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, realpathSync, writeFileSync } from 'node:fs';
 import { basename, dirname, isAbsolute, relative, resolve, sep } from 'node:path';
 
 function inside(root, path) {
@@ -7,12 +7,47 @@ function inside(root, path) {
   return !isAbsolute(pathFromRoot) && pathFromRoot !== '..' && !pathFromRoot.startsWith('..' + sep);
 }
 
+export function sqlitePath() {
+  return resolve(/* turbopackIgnore: true */ process.env.PROJECTOS_DB_PATH || './local-data/projectos.sqlite');
+}
+
+export function assertSqliteWritable(path = sqlitePath()) {
+  const marker = path + '.postgres-cutover';
+  try {
+    lstatSync(marker);
+  } catch (error) {
+    if (error.code === 'ENOENT') return;
+    throw error;
+  }
+  throw new Error('SQLite is sealed for PostgreSQL cutover');
+}
+
+export function sealSqliteSource(path) {
+  const source = realpathSync(path);
+  const marker = source + '.postgres-cutover';
+  let fd;
+  try { fd = openSync(marker, 'wx', 0o600); }
+  catch (error) {
+    if (error.code === 'EEXIST' && lstatSync(marker).isFile()) return;
+    throw error;
+  }
+  try {
+    writeFileSync(fd, 'ProjectOS PostgreSQL cutover\n');
+    fsyncSync(fd);
+  } finally { closeSync(fd); }
+  if (process.platform !== 'win32') {
+    const directory = openSync(dirname(marker), 'r');
+    try { fsyncSync(directory); } finally { closeSync(directory); }
+  }
+}
+
 export function openSqlite() {
-  const path = resolve(/* turbopackIgnore: true */ process.env.PROJECTOS_DB_PATH || './local-data/projectos.sqlite');
+  const path = sqlitePath();
   const forbidden = [resolve('public'),resolve('.next'),resolve('.git'),resolve('node_modules')];
   if (forbidden.some(root => inside(root, path))) throw new Error('Unsafe database location');
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   const canonical = resolve(realpathSync(dirname(path)), basename(path));
+  assertSqliteWritable(canonical);
   if (forbidden.some(root => inside(existsSync(root) ? realpathSync(root) : root, canonical))) {
     throw new Error('Unsafe database location');
   }

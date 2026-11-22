@@ -65,6 +65,32 @@ jobs:
       - run: npx playwright install --with-deps chromium
       - run: npm run test:project-lifecycle
 
+  cross-browser:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        browser: [firefox, webkit]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci --include=optional
+      - run: npm run build
+      - run: npx playwright install --with-deps ${{ matrix.browser }}
+      - name: Create loopback TLS fixture
+        run: |
+          fixture_dir="$RUNNER_TEMP/projectos-tls"
+          mkdir -p "$fixture_dir"
+          openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=127.0.0.1 \
+            -addext 'subjectAltName=IP:127.0.0.1' -keyout "$fixture_dir/loopback.key" -out "$fixture_dir/loopback.crt"
+          echo "PROJECTOS_TEST_TLS_KEY=$fixture_dir/loopback.key" >> "$GITHUB_ENV"
+          echo "PROJECTOS_TEST_TLS_CERT=$fixture_dir/loopback.crt" >> "$GITHUB_ENV"
+      - run: npx playwright test --config=playwright.config.ts --browser=${{ matrix.browser }}
+
   codeql:
     runs-on: ubuntu-24.04
     timeout-minutes: 25

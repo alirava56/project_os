@@ -15,6 +15,9 @@ BEGIN
         WHERE n.nspname = 'public' AND c.relowner = r.oid
       )
       AND NOT has_schema_privilege(r.oid, 'public', 'CREATE')
+      AND NOT has_table_privilege(r.oid,'public.delivery_retries','UPDATE')
+      AND NOT has_table_privilege(r.oid,'public.monitor_observations','INSERT')
+      AND NOT EXISTS(SELECT 1 FROM projectos_private.reminder_logins WHERE login=r.oid)
   ) THEN
     RAISE EXCEPTION 'Expected a dedicated unprivileged ProjectOS login';
   END IF;
@@ -22,10 +25,13 @@ END $$;
 
 GRANT USAGE ON SCHEMA public TO :"runtime_role";
 GRANT SELECT, INSERT, UPDATE ON users, workspaces, workspace_invites, auth_rate_limits, ai_quota,
-  notification_outbox, vault_checks, github_snapshots, machine_observations TO :"runtime_role";
+  vault_checks, github_snapshots, machine_observations TO :"runtime_role";
 GRANT SELECT, INSERT, UPDATE, DELETE ON memberships, sessions, records, record_tombstones,
   mfa_recovery_codes TO :"runtime_role";
 GRANT SELECT, INSERT ON audit_events, document_versions, github_deliveries TO :"runtime_role";
-GRANT SELECT ON delivery_retries, worker_heartbeats, monitor_observations TO :"runtime_role";
+GRANT SELECT ON monitor_observations TO :"runtime_role";
+SELECT projectos_private.grant_identity_runtime(:'runtime_role');
+SELECT projectos_private.grant_workspace_runtime(:'runtime_role');
+SELECT projectos_private.grant_record_projection(:'runtime_role');
 
 COMMIT;
