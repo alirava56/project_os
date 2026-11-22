@@ -287,6 +287,9 @@ try {
   const denied=await fetch(github,{method:'POST',headers:{...headers,...viewerHeaders},
     body:JSON.stringify({projectId:otherProject.id,repository:'fixture/second',backfill:true})});
   assert.equal(denied.status,403);
+  const mismatched=await fetch(github,{method:'POST',headers,
+    body:JSON.stringify({projectId:project.id,repository:'fixture/second',backfill:true})});
+  assert.equal(mismatched.status,404);
   const githubPayload=JSON.stringify({repository:{full_name:'fixture/second'}});
   const deliveryHeaders={'Content-Type':'application/json','X-GitHub-Event':'push','X-GitHub-Delivery':randomUUID(),
     'X-Hub-Signature-256':'sha256='+createHmac('sha256',webhookSecret).update(githubPayload).digest('hex')};

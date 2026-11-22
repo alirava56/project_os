@@ -1,8 +1,9 @@
 import { fork } from 'node:child_process';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { access, mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { request, test as playwright } from '@playwright/test';
+import { createPostgresFixture, type PostgresFixture } from './postgres-fixture';
 
 export const setupToken = 'this-is-a-public-test-only-token-not-a-secret';
 export type Origin = { Origin: string; 'Sec-Fetch-Site': 'same-origin' };
@@ -11,8 +12,8 @@ export function testRequest(appURL: string) {
   return request.newContext({baseURL:appURL,ignoreHTTPSErrors:testTls(appURL)});
 }
 
-export async function startTestApp({ sqlitePath, postgresUrl, enforceMfa = false }: {
-  sqlitePath: string; postgresUrl?: string; enforceMfa?: boolean;
+export async function startTestApp({ sqlitePath, postgresUrl, postgresScopeKey, enforceMfa = false }: {
+  sqlitePath: string; postgresUrl?: string; postgresScopeKey?: string; enforceMfa?: boolean;
 }) {
   const server = fork(resolve('scripts/prepare-e2e.mjs'), [], {
     stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
@@ -21,6 +22,8 @@ export async function startTestApp({ sqlitePath, postgresUrl, enforceMfa = false
       NODE_ENV: 'production',
       PROJECTOS_DB_PATH: sqlitePath,
       PROJECTOS_DATABASE_URL: postgresUrl ?? '',
+      PROJECTOS_DATABASE_MODE: postgresUrl ? 'postgres' : '',
+      PROJECTOS_DB_SCOPE_KEY: postgresScopeKey ?? '',
       PROJECTOS_REQUIRE_MFA: enforceMfa ? 'enabled' : 'disabled',
       PROJECTOS_SETUP_TOKEN: setupToken,
       PROJECTOS_MFA_ENCRYPTION_KEY: '35'.repeat(32),
@@ -61,13 +64,39 @@ export async function startTestApp({ sqlitePath, postgresUrl, enforceMfa = false
   }
 }
 
-export const test = playwright.extend<{ appURL: string; origin: Origin; enforceMfa: boolean }>({
+export type BackendOptions = {backend: 'sqlite' | 'postgres'};
+
+export const test = playwright.extend<BackendOptions & {
+  appURL: string; origin: Origin; enforceMfa: boolean; postgresFixture: PostgresFixture | undefined;
+}>({
+  backend: ['sqlite', { option:true }],
   enforceMfa: [false, { option:true }],
-  appURL: async ({enforceMfa}, provide) => {
+  postgresFixture: async ({backend}, provide) => {
+    if (backend === 'sqlite') return provide(undefined);
+    const database = await createPostgresFixture();
+    try { await provide(database); }
+    finally { await database.dispose(); }
+  },
+  appURL: async ({enforceMfa,postgresFixture}, provide) => {
     const dir = await mkdtemp(join(tmpdir(), 'projectos-smoke-'));
+    const sqlitePath = join(dir, 'smoke.sqlite');
     try {
-      const server = await startTestApp({sqlitePath:join(dir, 'smoke.sqlite'), enforceMfa});
-      try { await provide(server.url); }
+      const server = await startTestApp({
+        sqlitePath, enforceMfa, postgresUrl:postgresFixture?.url, postgresScopeKey:postgresFixture?.scopeKey,
+      });
+      try {
+        if (postgresFixture) {
+          const probe = await testRequest(server.url);
+          try {
+            if (!(await probe.get('/api/health')).ok()) throw new Error('Limited PostgreSQL browser fixture is unavailable');
+          } finally { await probe.dispose(); }
+        }
+        await provide(server.url);
+        if (postgresFixture) await access(sqlitePath).then(
+          () => { throw new Error('Unexpected SQLite file during PostgreSQL browser fixture'); },
+          (error:NodeJS.ErrnoException) => { if (error.code !== 'ENOENT') throw error; },
+        );
+      }
       finally { await server.stop(); }
     } finally {
       await rm(dir, { recursive: true, force: true, maxRetries: 5 });

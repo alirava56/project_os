@@ -44,6 +44,7 @@ export function DemoProvider({ children, initialData, initialVersion = 0, authen
   const dataRef = useRef(data);
   const revision = useRef(initialVersion);
   const queue = useRef<Promise<void>>(Promise.resolve());
+  const queueGeneration = useRef(0);
   const pending = useRef(0);
   const [saving, setSaving] = useState(false);
   const [syncError, setSyncError] = useState<string | null>(null);
@@ -70,31 +71,35 @@ export function DemoProvider({ children, initialData, initialVersion = 0, authen
     dataRef.current = snapshot.data;
     revision.current = snapshot.version;
     setData(snapshot.data);
+    return snapshot.version;
   }
 
   const change: Store['change'] = async (mutator, text) => {
     if (!authenticated) { notice('برای ذخیره اطلاعات، ابتدا وارد حساب خود شوید.'); return false; }
     if (dataRef.current.users[0]?.role === 'Viewer') { notice('حساب شما فقط مجوز مشاهده دارد.'); return false; }
-    const previous = dataRef.current;
-    const version = revision.current;
-    let next: DemoData;
-    try { next = mutator(structuredClone(previous)); }
-    catch { notice('انجام تغییر امکان‌پذیر نبود.'); return false; }
-
-    const changes = changesBetween(previous, next);
-    const preferences = JSON.stringify(previous.preferences) === JSON.stringify(next.preferences) ? undefined : next.preferences;
-    if (!changes.length && !preferences) return true;
-    const body = JSON.stringify({ version, changes, preferences });
+    const generation = queueGeneration.current;
     setSaving(true);
     pending.current++;
     const operation = queue.current.then(async () => {
+      if (generation !== queueGeneration.current) return false;
+      const previous = dataRef.current;
+      const version = revision.current;
+      let next: DemoData;
+      try { next = mutator(structuredClone(previous)); }
+      catch { notice('انجام تغییر امکان‌پذیر نبود.'); return false; }
+
+      const changes = changesBetween(previous, next);
+      const preferences = JSON.stringify(previous.preferences) === JSON.stringify(next.preferences) ? undefined : next.preferences;
+      if (!changes.length && !preferences) return true;
       let confirmed = false;
       try {
         const response = await fetch('/api/records', {
           method: 'PATCH', credentials: 'same-origin', cache: 'no-store',
-          headers: { 'Content-Type': 'application/json' }, body,
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ version, changes, preferences }),
         });
         if (response.status === 409) {
+          queueGeneration.current++;
           await refreshState();
           setSyncError('رکورد تغییر کرده است. آخرین نسخه دریافت شد. تغییر را دوباره بررسی و ثبت کنید.');
           return false;
@@ -106,11 +111,19 @@ export function DemoProvider({ children, initialData, initialVersion = 0, authen
           return false;
         }
         confirmed = true;
-        await refreshState();
-        setSyncError(null);
+        const committed = await response.json() as {version:number};
+        const refreshed = await refreshState();
+        // Only rebase queued edits across this browser's own acknowledged write.
+        if (committed.version !== version + 1 || refreshed !== committed.version) {
+          queueGeneration.current++;
+          setSyncError('تغییر شما ذخیره شد. داده‌های جدید هم دریافت شدند. تغییرات در انتظار را بررسی و دوباره ثبت کنید.');
+        } else {
+          setSyncError(null);
+        }
         notice(text);
         return true;
       } catch {
+        queueGeneration.current++;
         setSyncError(confirmed
           ? 'تغییر ذخیره شد. برای دریافت آخرین داده‌ها، صفحه را تازه کنید.'
           : 'نتیجهٔ ذخیره تأیید نشد. پیش از تلاش مجدد، صفحه را تازه کنید.');

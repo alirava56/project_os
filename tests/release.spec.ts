@@ -341,7 +341,11 @@ test('a dated exchange rate stays attributed and converts precise values without
   await expect(page.getByText('برآورد با نرخ انتخاب‌شده · ۱۲۵ تومان')).toBeVisible();
   await expect(page.locator('time[datetime="2026-01-15T14:30:00.000Z"]')).toBeVisible();
   await page.reload();
-  await expect(page.getByText('گزارش آزمایشی نرخ ۷',{exact:true})).toBeVisible();
+  // Open the panel in the viewport before checking the source after navigation.
+  await page.getByRole('heading',{name:'تبدیل ارز با نرخ ثبت‌شده'}).scrollIntoViewIfNeeded();
+  const source=page.getByText('گزارش آزمایشی نرخ ۷',{exact:true});
+  await expect(source).toBeVisible();
+  await expect(source).toBeInViewport();
   const snapshot=(await (await page.request.get('/api/state')).json()).data;
   expect(snapshot.exchangeRates).toEqual([expect.objectContaining({rate:'123.5',from:'USD',to:'TOMAN'})]);
   expect(snapshot.expenses).toEqual([]);
