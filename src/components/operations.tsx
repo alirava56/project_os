@@ -8,6 +8,7 @@ import { machineObservationFresh, type MachineObservation } from '@/lib/monitori
 import { savePreferences, useDemo } from '@/lib/store';
 import type { Incident } from '@/lib/types';
 import { ProjectFilter, projectName } from './forms';
+import { NotificationStatus } from './notification-status';
 import { Button, Callout, Empty, Filter, Heading, Metrics, Modal, Panel, Pill, Row, SearchField, Switch, TextLink } from './ui';
 
 export function Monitoring() {
@@ -169,6 +170,7 @@ export function Alerts() {
     {alert && <Modal title="بررسی هشدار" onClose={() => setSelected(undefined)}><div className="form-stack">
       <Row icon={Bell} title={alert.title} meta={<>{projectName(data,alert.projectId)} · {alert.source}</>} end={<Pill tone={priorityTones[alert.priority]}>{priorities[alert.priority]}</Pill>} />
       <p className="muted">وضعیت: {incidentStates[alert.state]}{alert.snoozedUntil && ` · تا ${dateLabel(alert.snoozedUntil,{day:'numeric',month:'long',hour:'2-digit',minute:'2-digit'},data.preferences.zone)}`}</p>
+      {/^(auto|monitor)-[a-f0-9]{28}$/.test(alert.id) && <NotificationStatus key={alert.id} alert={alert.id} zone={data.preferences.zone} />}
       {alertError && <p className="form-error" role="alert">{alertError}</p>}
       <div className="form-actions">{alert.state !== 'resolved' && alert.state !== 'dismissed' && <>
         {alert.state !== 'acknowledged' && <Button disabled={saving} onClick={() => updateState('acknowledged')}>ثبت رسیدگی</Button>}
@@ -179,6 +181,7 @@ export function Alerts() {
       </div>
     </div></Modal>}
     {config && <Modal title="تنظیم یادآوری‌ها" onClose={() => setConfig(false)}><Callout>ترجیحات در فضای کاری ذخیره می‌شوند. ارسال بیرونی از طریق Worker تلگرام یا ایمیل انجام می‌شود.</Callout>{settings()}
+      {data.users[0]?.role === 'Owner' && <NotificationStatus zone={data.preferences.zone} />}
       <div className="modal-footer"><TextLink href="/calendar">ثبت یادآوری در تقویم</TextLink></div>
     </Modal>}
   </>;

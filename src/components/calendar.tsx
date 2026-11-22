@@ -4,6 +4,8 @@ import { useState } from 'react';
 import { CalendarDays, ChevronLeft, ChevronRight, Clock3, Flag, ListTodo, Plus } from 'lucide-react';
 import { dateLabel, localDate, number, taskHref, today } from '@/lib/format';
 import { useDemo } from '@/lib/store';
+import { wallClock } from '@/lib/reminder-time';
+import type { Reminder } from '@/lib/types';
 import { ProjectFilter, ReminderForm, projectName } from './forms';
 import { Button, Empty, Heading, IconButton, Metrics, Modal, Panel, Pill, Row, Segments } from './ui';
 
@@ -23,24 +25,28 @@ export function Calendar() {
   const [mode,setMode] = useState<'month' | 'week'>('month');
   const [selection, setSelection] = useState<string | null>(null);
   const [create, setCreate] = useState<string | null>(null);
+  const [editing,setEditing] = useState<Reminder>();
+  const canEdit = data.users[0]?.role !== 'Viewer';
   const anchor = asDate(cursor);
   const startOfMonth = firstDay(anchor);
   const afterMonth = firstDay(addDays(startOfMonth,32));
   const start = mode === 'month' ? addDays(startOfMonth,-beforeWeek(startOfMonth)) : addDays(anchor,-beforeWeek(anchor));
   const count = mode === 'month' ? Math.ceil((Math.round((afterMonth.getTime() - start.getTime()) / 86400000)) / 7) * 7 : 7;
   const events = [
-    ...data.tasks.map(t => ({id:t.id,title:t.title,due:t.due,kind:'وظیفه',projectId:t.projectId,href:taskHref(t.id)})),
-    ...data.reminders.map(r => ({...r,href:undefined})),
-    ...data.resources.flatMap(r => r.expires ? [{id:r.id,title:`تمدید ${r.name}`,due:r.expires,kind:'تمدید',projectId:r.projectId,href:undefined}] : []),
-  ].filter(e => !projectScope || projectScope === e.projectId).sort((a,b) => a.due.localeCompare(b.due));
-  const nextEvents = events.filter(e => e.due >= cursor).slice(0,5);
-  const monthEvents = events.filter(e => e.due >= localDate(startOfMonth) && e.due < localDate(afterMonth));
+    ...data.tasks.map(t => ({id:t.id,title:t.title,due:t.due,kind:'وظیفه',projectId:t.projectId,href:taskHref(t.id),reminder:undefined})),
+    ...data.reminders.map(r => ({...r,reminder:r,href:undefined})),
+    ...data.resources.flatMap(r => r.expires ? [{id:r.id,title:`تمدید ${r.name}`,due:r.expires,kind:'تمدید',projectId:r.projectId,href:undefined,reminder:undefined}] : []),
+  ].filter(e => !projectScope || projectScope === e.projectId).map(e => ({...e,
+    day:e.due.includes('T') ? wallClock(e.reminder?.zone ?? data.preferences.zone,new Date(e.due)).slice(0,10) : e.due,
+  })).sort((a,b) => a.day.localeCompare(b.day));
+  const nextEvents = events.filter(e => e.day >= cursor).slice(0,5);
+  const monthEvents = events.filter(e => e.day >= localDate(startOfMonth) && e.day < localDate(afterMonth));
   const move = (direction: number) => setCursor(localDate(mode === 'week' ? addDays(anchor, direction * 7) :
     direction > 0 ? afterMonth : firstDay(addDays(startOfMonth,-1))));
 
   return <>
     <Heading title="تقویم و برنامه‌ریزی" subtitle="موعد تحویل کارها، تمدید سرویس‌ها و رویدادهای پروژه‌ها">
-      <Button variant="primary" icon={Plus} onClick={() => setCreate(cursor)}>رویداد جدید</Button>
+      {canEdit && <Button variant="primary" icon={Plus} onClick={() => setCreate(cursor)}>رویداد جدید</Button>}
     </Heading>
     <div className="stack">
       <Metrics entries={[
@@ -60,7 +66,7 @@ export function Calendar() {
             {Array.from({length:count},(_,index) => {
               const date = addDays(start,index);
               const value = localDate(date);
-              const daily = events.filter(e => e.due === value);
+              const daily = events.filter(e => e.day === value);
               const outside = date < startOfMonth || date >= afterMonth;
               return <button type="button" key={value} className={`calendar-cell ${outside ? 'outside' : ''} ${value === cursor ? 'selected' : ''}`}
                 aria-label={`${dateLabel(value,{day:'numeric',month:'long',year:'numeric'})}، ${number(daily.length)} رویداد`} onClick={() => setSelection(value)}>
@@ -73,15 +79,18 @@ export function Calendar() {
         </Panel>
         <Panel title="رویدادهای پیش‌رو">
           {nextEvents.length ? nextEvents.map(e => <Row key={e.id} icon={Clock3} title={e.title} meta={<bdi>{projectName(data,e.projectId)}</bdi>}
-            end={<Pill>{dateLabel(e.due)}</Pill>} href={e.href} onClick={e.href ? undefined : () => setSelection(e.due)} />) : <Empty title="رویدادی پس از این تاریخ وجود ندارد" />}
+            end={<Pill>{dateLabel(e.due)}</Pill>} href={e.href} onClick={e.href ? undefined : () => setSelection(e.day)} />) : <Empty title="رویدادی پس از این تاریخ وجود ندارد" />}
         </Panel>
       </div>
     </div>
     {selection && <Modal title={dateLabel(selection,{day:'numeric',month:'long',year:'numeric'})} onClose={() => setSelection(null)}>
-      {events.filter(e => e.due === selection).map(e => <Row key={e.id} icon={CalendarDays} title={e.title} meta={e.kind} href={e.href} />)}
-      {!events.some(e => e.due === selection) && <Empty title="رویدادی در این روز ثبت نشده است" />}
-      <div className="modal-footer"><Button variant="primary" icon={Plus} onClick={() => { setCreate(selection); setSelection(null); }}>افزودن رویداد در این روز</Button></div>
+      {events.filter(e => e.day === selection).map(e => <Row key={e.id} icon={CalendarDays} title={e.title}
+        meta={e.reminder?.paused ? e.kind + ' · متوقف‌شده' : e.kind} href={e.href}
+        onClick={canEdit && e.reminder ? () => { setEditing(e.reminder); setSelection(null); } : undefined} />)}
+      {!events.some(e => e.day === selection) && <Empty title="رویدادی در این روز ثبت نشده است" />}
+      {canEdit && <div className="modal-footer"><Button variant="primary" icon={Plus} onClick={() => { setCreate(selection); setSelection(null); }}>افزودن رویداد در این روز</Button></div>}
     </Modal>}
     {create && <ReminderForm due={create} projectId={projectScope} onClose={() => setCreate(null)} />}
+    {editing && <ReminderForm reminder={editing} onClose={() => setEditing(undefined)} />}
   </>;
 }

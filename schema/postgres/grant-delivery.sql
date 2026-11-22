@@ -1,5 +1,6 @@
 \set ON_ERROR_STOP on
 BEGIN;
+SELECT pg_advisory_xact_lock(3804521);
 SELECT set_config('projectos.install_delivery_role', :'delivery_role', true),
        set_config('projectos.install_delivery_workspace', :'workspace_id', true);
 DO $$
@@ -25,8 +26,8 @@ BEGIN
     target, target, workspace);
   EXECUTE format('CREATE POLICY %I ON public.delivery_retries AS RESTRICTIVE TO %I USING
     (EXISTS (SELECT 1 FROM public.notification_outbox o WHERE o.id = notification_id))',target,target);
-  EXECUTE format('CREATE POLICY %I ON public.worker_heartbeats AS RESTRICTIVE TO %I USING (name = %L)',
-    target,target,'delivery');
+  EXECUTE format('CREATE POLICY %I ON public.worker_heartbeats AS RESTRICTIVE TO %I USING (name = %L OR
+    EXISTS (SELECT 1 FROM public.workspaces w WHERE worker_heartbeats.name=%L||w.id))',target,target,'delivery','delivery/');
   EXECUTE format('CREATE POLICY %I ON public.workspaces AS RESTRICTIVE TO %I USING (id = %L)',
     target,target,workspace);
 END $$;

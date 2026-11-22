@@ -12,8 +12,9 @@ export function testRequest(appURL: string) {
   return request.newContext({baseURL:appURL,ignoreHTTPSErrors:testTls(appURL)});
 }
 
-export async function startTestApp({ sqlitePath, postgresUrl, postgresScopeKey, enforceMfa = false }: {
+export async function startTestApp({ sqlitePath, postgresUrl, postgresScopeKey, enforceMfa = false, vault }: {
   sqlitePath: string; postgresUrl?: string; postgresScopeKey?: string; enforceMfa?: boolean;
+  vault?: {origin:string;workspace:string;token:string;ca:string};
 }) {
   const server = fork(resolve('scripts/prepare-e2e.mjs'), [], {
     stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
@@ -32,6 +33,10 @@ export async function startTestApp({ sqlitePath, postgresUrl, postgresScopeKey, 
       PROJECTOS_GITHUB_TOKEN: '',
       PROJECTOS_AI_ENABLED: 'disabled',
       PROJECTOS_TELEGRAM_NOTIFICATIONS: 'disabled',
+      ...(vault ? {
+        PROJECTOS_VAULT_ORIGIN:vault.origin,PROJECTOS_VAULT_WORKSPACE:vault.workspace,
+        PROJECTOS_VAULT_TOKEN:vault.token,PROJECTOS_VAULT_MOUNTS:'fixture-kv',NODE_EXTRA_CA_CERTS:vault.ca,
+      } : {}),
     },
   });
   let logs = '';
@@ -68,6 +73,7 @@ export type BackendOptions = {backend: 'sqlite' | 'postgres'};
 
 export const test = playwright.extend<BackendOptions & {
   appURL: string; origin: Origin; enforceMfa: boolean; postgresFixture: PostgresFixture | undefined;
+  testApp: Awaited<ReturnType<typeof startTestApp>>;
 }>({
   backend: ['sqlite', { option:true }],
   enforceMfa: [false, { option:true }],
@@ -77,7 +83,7 @@ export const test = playwright.extend<BackendOptions & {
     try { await provide(database); }
     finally { await database.dispose(); }
   },
-  appURL: async ({enforceMfa,postgresFixture}, provide) => {
+  testApp: async ({enforceMfa,postgresFixture}, provide) => {
     const dir = await mkdtemp(join(tmpdir(), 'projectos-smoke-'));
     const sqlitePath = join(dir, 'smoke.sqlite');
     try {
@@ -91,7 +97,7 @@ export const test = playwright.extend<BackendOptions & {
             if (!(await probe.get('/api/health')).ok()) throw new Error('Limited PostgreSQL browser fixture is unavailable');
           } finally { await probe.dispose(); }
         }
-        await provide(server.url);
+        await provide(server);
         if (postgresFixture) await access(sqlitePath).then(
           () => { throw new Error('Unexpected SQLite file during PostgreSQL browser fixture'); },
           (error:NodeJS.ErrnoException) => { if (error.code !== 'ENOENT') throw error; },
@@ -102,6 +108,7 @@ export const test = playwright.extend<BackendOptions & {
       await rm(dir, { recursive: true, force: true, maxRetries: 5 });
     }
   },
+  appURL: async ({testApp}, provide) => provide(testApp.url),
   baseURL: async ({ appURL }, provide) => { await provide(appURL); },
   ignoreHTTPSErrors: async ({ appURL }, provide) => { await provide(testTls(appURL)); },
   origin: async ({ appURL }, provide) => { await provide({ Origin: appURL, 'Sec-Fetch-Site': 'same-origin' }); },

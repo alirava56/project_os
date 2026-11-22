@@ -4,13 +4,25 @@
 
 ## Vault
 
-`PROJECTOS_VAULT_WORKSPACE`، `PROJECTOS_VAULT_ORIGIN` و `PROJECTOS_VAULT_MOUNTS` را به میزبان HTTPS و Mountهای مجاز محدود کنید. `PROJECTOS_VAULT_TOKEN` باید فقط حق خواندن `<mount>/metadata/<prefix>/*` در KV v2 را داشته باشد. دسترسی مسیر `data` لازم نیست. مالک با رمز و عامل دوم فعال می‌تواند فراداده را بررسی کند. API تنها وضعیت، زمان و شمارهٔ نسخهٔ فراداده را ذخیره می‌کند. حذف، قطعی، عدم تنظیم و قدیمی بودن بررسی به‌صورت جدا نمایش داده می‌شوند. [قرارداد HashiCorp KV v2](https://developer.hashicorp.com/vault/api-docs/secret/kv/kv-v2)
+`PROJECTOS_VAULT_WORKSPACE`، `PROJECTOS_VAULT_ORIGIN` و `PROJECTOS_VAULT_MOUNTS` را به میزبان HTTPS و Mountهای مجاز محدود کنید. `PROJECTOS_VAULT_PREFIXES` محدودیت محلی اختیاری با قالب `mount/prefix` و جداکنندهٔ ویرگول است. `PROJECTOS_VAULT_TOKEN` باید فقط حق خواندن `<mount>/metadata/<prefix>/*` در KV v2 را داشته باشد. دسترسی مسیر `data` لازم نیست. مالک با رمز و عامل دوم فعال می‌تواند فراداده را بررسی کند. API تنها وضعیت، زمان و شمارهٔ نسخهٔ فراداده را ذخیره می‌کند. نبود فرادادهٔ فعال، قطع سرویس، رد دسترسی، اتصال تنظیم‌نشده و بررسی منقضی در رابط وضعیت جداگانه دارند. پاسخ KV v2 محدود و اعتبار گواهی HTTPS با زنجیرهٔ اعتماد Node بررسی می‌شود. برای گواهی داخلی، CA سازمان را در زمان راه‌اندازی فرایند با `NODE_EXTRA_CA_CERTS` معرفی کنید. توکن را در تنظیمات خصوصی همان فرایند قرار دهید. [قرارداد HashiCorp KV v2](https://developer.hashicorp.com/vault/api-docs/secret/kv/kv-v2)
 
 ## اعلان و زمان‌بندی
 
-`PROJECTOS_NOTIFICATION_WORKSPACE` مقصد فضای کاری را محدود می‌کند. Telegram و Email به‌صورت جداگانه Opt-in هستند. ایمیل از Resend و شناسهٔ ثابت Idempotency استفاده می‌کند. Telegram پذیرش Provider را ثبت می‌کند. خطا به Retry و بعد از پنج تلاش به `failed` می‌انجامد. بعد از از دست رفتن Lease امکان تکرار ارسال وجود دارد. وضعیت `delivered` رسید خواندن نیست.
+`PROJECTOS_NOTIFICATION_WORKSPACE` ارسال را به یک Workspace محدود می‌کند. دو کانال جداگانه فعال می‌شوند. Telegram از `PROJECTOS_TELEGRAM_BOT_TOKEN` و `PROJECTOS_TELEGRAM_CHAT_ID` استفاده می‌کند. پیام پیش‌فرض فقط زمان را دارد. برای گروه خصوصی تأییدشده، تنظیم `PROJECTOS_TELEGRAM_PROJECT_DETAILS=enabled` عنوان هشدار و نام پروژه را به متن ساده اضافه می‌کند. ایمیل Resend با `PROJECTOS_RESEND_API_KEY`، `PROJECTOS_EMAIL_FROM` و `PROJECTOS_EMAIL_TO` تنظیم می‌شود. از فرستندهٔ تأییدشده و گیرندهٔ آزمایشی استفاده کنید. متن و HTML ایمیل عمومی‌اند و نام پروژه و عنوان خصوصی را منتقل نمی‌کنند. [Telegram Bot API](https://core.telegram.org/bots/api) · [قرارداد Resend](https://resend.com/docs/api-reference/emails/send-email)
 
-`PROJECTOS_REMINDER_OFFSETS` پیش‌فرض `14,7,3,1,0` دارد. یک موعد UTC ابتدا به روز محلی در zone موردنظر تبدیل می‌شود. زمان‌بندی تکرار روزانه، هفتگی و تقویمی ماهانه یا سالانه را دارد. قراردادها و چرخش Vault می‌توانند سررسید بسازند. Digest در صورت داشتن موعد باز، روزانه یک کلید ثابت دارد. زمان‌بند، ارسال و پایش باید در سامانهٔ عملیاتی اجرا شوند.
+ارسال موفق در رابط «پذیرفته‌شده توسط ارائه‌دهنده» است. محدودیت نرخ و خطای موقت به تلاش مجدد با فاصلهٔ حداقل اعلام‌شده منتهی می‌شوند. حداکثر پنج تلاش در مهلت همان روز محلی انجام می‌شود. Timeout، قطع ارتباط یا توقف پردازشگر بعد از شروع درخواست می‌تواند نتیجهٔ ارسال را نامعلوم بگذارد. در این حالت ارسال خودکار دیگری انجام نمی‌شود. Resend برای تلاش‌های مجدد کلید ثابت دارد. Telegram تضمین تحویل دقیقاً یک‌بار ندارد. [کلید Idempotency در Resend](https://resend.com/docs/dashboard/emails/idempotency-keys)
+
+`PROJECTOS_REMINDER_OFFSETS` پیش‌فرض `14,7,3,1,0` دارد. یک موعد UTC ابتدا به روز محلی در zone موردنظر تبدیل می‌شود. زمان‌بندی تکرار روزانه، هفتگی و تقویمی ماهانه یا سالانه را دارد. قراردادها و چرخش Vault می‌توانند سررسید بسازند. Digest در صورت داشتن موعد باز، روزانه یک کلید ثابت دارد. در تقویم می‌توان موعد، ساعت محلی، تکرار و توقف یادآوری را تنظیم کرد. در «هشدارها و یادآوری‌ها» زمان پذیرش و تلاش بعدی برای هر کانال نمایش داده می‌شود. گزینهٔ تنظیمات یادآوری‌ها آخرین اجرای ثبت‌شدهٔ هر پردازشگر را برای مالک همان Workspace نشان می‌دهد.
+
+### اجرای محلی با PostgreSQL
+
+۱. یک پایگاه آزمایشی Loopback آماده کنید. با حساب مالک طرح، `npm run db:migrate` و سپس دستورهای اختصاص نقش در `schema/postgres/grant-runtime.sql`، `grant-reminder.sql` و `grant-delivery.sql` را مطابق راهنمای PostgreSQL اجرا کنید. وب، زمان‌بند و تحویل با سه حساب مجزا اجرا می‌شوند.
+
+۲. در محیط خصوصی Worker مقدار `PROJECTOS_LOCAL_REMINDER_DATABASE_URL` و شناسهٔ `PROJECTOS_NOTIFICATION_WORKSPACE` را تنظیم کنید. برای تحویل بیرونی، `PROJECTOS_LOCAL_DELIVERY_DATABASE_URL`، تنظیمات کانال و `PROJECTOS_TELEGRAM_NOTIFICATIONS=enabled` یا `PROJECTOS_EMAIL_NOTIFICATIONS=enabled` را نیز تنظیم کنید. بدون فعال‌سازی کانال، زمان‌بند فقط اعلان درون برنامه می‌سازد. آزمون محلی ارائه‌دهندگان بدون ارسال بیرونی از `npm run test:core` و سناریوی PostgreSQL Browser اجرا می‌شود.
+
+۳. برنامه را در یک ترمینال و `npm run workers:local` را در ترمینال جدا اجرا کنید. فاصلهٔ پیش‌فرض ۳۰ ثانیه است و با `PROJECTOS_LOCAL_WORKER_INTERVAL_MS` تغییر می‌کند. خروجی هر چرخه، وضعیت زمان‌بند و تحویل را نشان می‌دهد. با Ctrl+C چرخهٔ جدید شروع نمی‌شود و عملیات فعال فرصت پایان دارد. روی یک Workspace تنظیم کانال یکسان نگه داشته می‌شود. قفل Workspace و Lease صف میان پردازشگرها در PostgreSQL اعمال می‌شوند.
+
+۴. در تقویم یک یادآوری بسازید، در «هشدارها» آن را باز کنید و وضعیت کانال را ببینید. برای آزمون خطا و تلاش مجدد با سرویس ساختگی، سناریوی `restricted PostgreSQL reminder workers` در مجموعهٔ Playwright را اجرا کنید. سناریوی Vault در همین مجموعه به گواهی آزمایشی Loopback با IP SAN برای `127.0.0.1` و مسیرهای `PROJECTOS_TEST_TLS_KEY` و `PROJECTOS_TEST_TLS_CERT` نیاز دارد. CI گواهی موقت خود را می‌سازد.
 
 ## GitHub
 

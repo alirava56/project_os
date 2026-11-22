@@ -74,6 +74,18 @@ export function openSqlite() {
     addColumn(db, 'workspace_invites', 'project_ids', 'TEXT');
     addColumn(db, 'records', 'record_version', 'INTEGER NOT NULL DEFAULT 0');
     addColumn(db, 'delivery_retries', 'lease_token', 'TEXT');
+    addColumn(db, 'notification_outbox', 'expires_at', 'INTEGER');
+    addColumn(db, 'notification_outbox', 'telegram_title', 'TEXT');
+    addColumn(db, 'notification_outbox', 'telegram_project', 'TEXT');
+    if (addColumn(db, 'delivery_retries', 'dispatch_at', 'INTEGER')) {
+      db.exec("UPDATE delivery_retries SET dispatch_at=claimed_at WHERE notification_id IN (SELECT id FROM notification_outbox WHERE state='sending')");
+    }
+    addColumn(db, 'delivery_retries', 'provider_id', 'TEXT');
+    addColumn(db, 'delivery_retries', 'last_error', 'TEXT');
+    db.exec(`CREATE TRIGGER IF NOT EXISTS projectos_notification_cancellation AFTER UPDATE OF state ON notification_outbox
+      FOR EACH ROW WHEN OLD.state='sending' AND NEW.state='cancelled' AND EXISTS (
+        SELECT 1 FROM delivery_retries WHERE notification_id=OLD.id AND dispatch_at IS NOT NULL
+      ) BEGIN UPDATE notification_outbox SET state='unknown' WHERE id=OLD.id; END`);
     addColumn(db, 'monitor_observations', 'tls_expires_at', 'TEXT');
     addColumn(db, 'monitor_observations', 'source', "TEXT NOT NULL DEFAULT 'https'");
     addColumn(db, 'machine_observations', 'disk_used_bytes', 'INTEGER');

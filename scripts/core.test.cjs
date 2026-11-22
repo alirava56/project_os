@@ -398,7 +398,7 @@ test('reminder worker disambiguates same-id sources and reconciles Telegram opt-
   const now=(await loadState(owner)),modified=structuredClone(now.data);
   modified.preferences.renewal=true;
   modified.reminders=[{id:'duplicate-id',title:'Direct reminder',projectId:'a',kind:'تمدید',due:today},
-    {id:'iso-due-reminder',title:'UTC due date',projectId:'a',kind:'یادآوری',due:new Date().toISOString().slice(0,10)+'T12:00:00Z'}];
+    {id:'iso-due-reminder',title:'UTC due date',projectId:'a',kind:'یادآوری',due:new Date().toISOString()}];
   modified.resources.push({id:'duplicate-id',name:'Shared server',projectId:'a',linkedProjectIds:[],type:'server',address:'203.0.113.6',environment:'Production',status:'registered',provider:'Test',tags:[],expires:today});
   modified.charges.push({id:'duplicate-id',projectId:'a',title:'Same-id subscription',provider:'Test',amount:100,currency:'TOMAN',period:'monthly',nextDue:today,status:'active'});
   (await saveState(owner,now.version,parseState(modified)));
@@ -579,7 +579,7 @@ test('calendar recurrence clamps month end and keeps wall-calendar dates over DS
 });
 
 test('expired notification lease can be reclaimed and a stale worker cannot finalize it',async ()=>{
-  const {claimDelivery,finishDelivery}=await import('./notification-delivery.mjs');
+  const {claimDelivery,beginDelivery,finishDelivery}=await import('./notification-delivery.mjs');
   const now=Date.now();
   const id='synthetic-email-lease';
   getDb().prepare(`INSERT INTO notification_outbox(id,workspace_id,reminder_id,scheduled_for,channel,state,created_at)
@@ -592,6 +592,7 @@ test('expired notification lease can be reclaimed and a stale worker cannot fina
   assert.equal(recovered.attempts,2);
   assert.notEqual(recovered.lease,acquired.lease);
   assert.equal(await finishDelivery(acquired,true,now+120002),false);
+  assert.equal(await beginDelivery(recovered,now+120002),true);
   assert.equal(await finishDelivery(recovered,true,now+120002),true);
   assert.equal(getDb().prepare('SELECT state FROM notification_outbox WHERE id=?').get(id).state,'delivered');
 });
@@ -704,8 +705,8 @@ test('Vault metadata probe uses the approved metadata path and discards provider
   assert.deepEqual(await verifyVaultReference(pointer,settings,stub),{status:'verified',providerVersion:3});
   assert.deepEqual(await verifyVaultReference({...pointer,vaultMount:'other'},settings,stub),{status:'not_configured',providerVersion:null});
   assert.equal(calls,1);
-  assert.equal((await verifyVaultReference(pointer,settings,async()=>new Response(null,{status:403}))).status,'unknown');
-  assert.equal((await verifyVaultReference(pointer,settings,async()=>{throw Error('simulated outage');})).status,'unknown');
+  assert.equal((await verifyVaultReference(pointer,settings,async()=>new Response(null,{status:403}))).status,'permission_denied');
+  assert.equal((await verifyVaultReference(pointer,settings,async()=>{throw Error('simulated outage');})).status,'unavailable');
 });
 
 test('GitHub quota is reported with a retry timestamp and signed data is validated',async ()=>{
@@ -867,4 +868,52 @@ test('model citations accept literal permitted text and reject unsupported or wr
   assert.equal(verifyQuotes(JSON.stringify({quotes:[{id:'doc:test',quote:'support sentence.'}]}),sources).length,1);
   assert.deepEqual(verifyQuotes(JSON.stringify({quotes:[{id:'doc:test',quote:'unverified text'}]}),sources),[]);
   assert.deepEqual(verifyQuotes(JSON.stringify({quotes:[{id:'doc:outside',quote:'support sentence.'}]}),sources),[]);
+});
+
+test('notification claim cannot send after cancellation and an interrupted dispatch is never reclaimed', async () => {
+  const {claimDelivery,beginDelivery,finishDelivery}=await import('./notification-delivery.mjs');
+  const {closeDatabase}=await import('./database.mjs');
+  const original=process.env.PROJECTOS_DB_PATH;
+  await closeDatabase();
+  process.env.PROJECTOS_DB_PATH=path.join(temp,'dispatch-lifecycle.sqlite');
+  try {
+    const user=await setupOwner({setupToken:process.env.PROJECTOS_SETUP_TOKEN,email:'queue-fixture@example.test',
+      password:'synthetic-queue-fixture-test-only',displayName:'Queue fixture',workspace:'Local queue fixture'});
+    const {accountByUser}=require('../src/lib/server/db.ts');
+    const account=await accountByUser(user);
+    const now=Date.now();
+    function insert(id,expiresAt) {
+      getDb().prepare(`INSERT INTO notification_outbox(id,workspace_id,reminder_id,scheduled_for,channel,state,created_at,expires_at)
+        VALUES(?,?,?,'2031-03-05','email','pending',?,?)`)
+        .run(id,account.workspaceId,id,new Date(now).toISOString(),expiresAt);
+    }
+    function state(id) { return getDb().prepare('SELECT state FROM notification_outbox WHERE id=?').get(id).state; }
+    function cancel(id) { getDb().prepare("UPDATE notification_outbox SET state='cancelled' WHERE id=?").run(id); }
+    insert('expired',now);
+    insert('cancel-before',now+600_000);
+    const before=await claimDelivery(account.workspaceId,'email',now);
+    assert.equal(before.id,'cancel-before');
+    assert.equal(state('expired'),'failed');
+    cancel(before.id);
+    assert.equal(await beginDelivery(before,now),false);
+    assert.equal(state(before.id),'cancelled');
+
+    insert('cancel-during',now+600_000);
+    const during=await claimDelivery(account.workspaceId,'email',now);
+    assert.equal(await beginDelivery(during,now),true);
+    cancel(during.id);
+    assert.equal(state(during.id),'unknown');
+    assert.equal(await finishDelivery(during,{kind:'accepted',id:'57'},now+1),false);
+
+    insert('interrupted',now+600_000);
+    const interrupted=await claimDelivery(account.workspaceId,'email',now);
+    assert.equal(await beginDelivery(interrupted,now),true);
+    await closeDatabase();
+    assert.equal(await claimDelivery(account.workspaceId,'email',now+120_001),undefined);
+    assert.equal(state(interrupted.id),'unknown');
+    assert.equal(await finishDelivery(interrupted,{kind:'accepted',id:'57'},now+120_002),false);
+  } finally {
+    await closeDatabase();
+    process.env.PROJECTOS_DB_PATH=original;
+  }
 });

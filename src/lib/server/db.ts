@@ -264,7 +264,30 @@ function standaloneDeadline(kind: RecordKind, record?: WorkspaceRecord) {
 
 async function retireChangedDeadlines(db: SqlExecutor, workspace: string, changes: PreparedChange[]) {
   for (const {kind, id, previous, record} of changes) {
-    if (!previous || (kind !== 'tasks' && kind !== 'resources')) continue;
+    if (!previous) continue;
+    if (kind === 'reminders') {
+      const before = JSON.parse(previous.payload) as DemoData['reminders'][number];
+      const after = record as DemoData['reminders'][number] | undefined;
+      const timing = (item?: DemoData['reminders'][number]) => item && !item.paused
+        ? [item.due,item.projectId,item.kind,item.repeat,item.zone,item.noticeDays] : null;
+      if (timing(before) && !isDeepStrictEqual(timing(before),timing(after))) {
+        if (db.scopeIdentity) await db.one('SELECT public.projectos_retire_explicit_reminder(?)',id);
+        else {
+          const alerts = await db.all<{id:string}>(`SELECT i.id FROM records i JOIN notification_outbox n
+            ON n.workspace_id=i.workspace_id AND n.id=i.id AND n.channel='in_app'
+            WHERE i.workspace_id=? AND i.kind='incidents' AND i.project_id=? AND n.reminder_id=?`,
+          workspace,before.projectId,'reminders:' + id);
+          for (const alert of alerts) {
+            if (!/^auto-[a-f0-9]{28}$/.test(alert.id)) continue;
+            await db.run(`UPDATE notification_outbox SET state='cancelled' WHERE workspace_id=?
+              AND (id=? OR id=? OR id=? OR id LIKE ? OR id LIKE ?) AND state IN ('pending','retrying','sending','available')`,
+            workspace,alert.id,'tg-' + alert.id,'email-' + alert.id,'tg-' + alert.id + '-%','email-' + alert.id + '-%');
+          }
+        }
+      }
+      continue;
+    }
+    if (kind !== 'tasks' && kind !== 'resources') continue;
     const before = standaloneDeadline(kind, JSON.parse(previous.payload) as WorkspaceRecord);
     const after = standaloneDeadline(kind, record);
     if (!before || (before.date === after?.date && before.projectId === after?.projectId)) continue;

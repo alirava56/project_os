@@ -1,5 +1,6 @@
 \set ON_ERROR_STOP on
 BEGIN;
+SELECT pg_advisory_xact_lock(3804521);
 SELECT set_config('projectos.install_monitor_role', :'monitor_role', true),
        set_config('projectos.install_monitor_workspace', :'workspace_id', true);
 DO $$

@@ -125,16 +125,19 @@ export function Infrastructure() {
 }
 
 function VaultMetadata({reference}:{reference:SecretReference}){
-  const [status,setStatus]=useState<{status:string;checkedAt:string|null}>({status:'unknown',checkedAt:null});
+  const [status,setStatus]=useState<{status:string;checkedAt:string|null}>({status:'loading',checkedAt:null});
   const [error,setError]=useState('');
   const [busy,setBusy]=useState(false);
   const route='/api/vault/'+encodeURIComponent(reference.id);
   useEffect(()=>{
     const controller=new AbortController();
     fetch(route,{cache:'no-store',signal:controller.signal}).then(async response=>{
-      if(response.ok)setStatus(await response.json());
-      else setError('وضعیت ارجاع در دسترس نیست.');
-    }).catch(()=>{if(!controller.signal.aborted)setError('وضعیت ارجاع در دسترس نیست.');});
+      if (!response.ok) throw new Error('Vault status unavailable');
+      const result=await response.json();
+      if (!controller.signal.aborted) setStatus(result);
+    }).catch(()=>{
+      if (!controller.signal.aborted) setStatus({status:'unavailable',checkedAt:null});
+    });
     return ()=>controller.abort();
   },[route]);
   async function verify(event:FormEvent<HTMLFormElement>){
@@ -144,12 +147,14 @@ function VaultMetadata({reference}:{reference:SecretReference}){
     try{
       const response=await fetch(route,{method:'POST',headers:{'Content-Type':'application/json'},
         body:JSON.stringify({password:get('password'),totp:get('totp')})});
-      if(!response.ok)throw new Error('بررسی انجام نشد. رمز و کد ورود را بررسی کنید.');
+      if(response.status===403) throw new Error('بررسی به رمز حساب و در صورت فعال بودن، کد تازهٔ MFA نیاز دارد.');
+      if(response.status===429) throw new Error('دفعات بررسی زیاد است. کمی بعد دوباره تلاش کنید.');
+      if(!response.ok) throw new Error('بررسی فراداده انجام نشد.');
       setStatus(await response.json());
     }catch(error){setError(error instanceof Error?error.message:'بررسی انجام نشد.');}
     finally{setBusy(false);form.reset();}
   }
-  const labels:Record<string,string>={verified:'فراداده تأیید شد',not_configured:'اتصال تنظیم نشده',unknown:'نامشخص',stale:'بررسی قدیمی',not_found:'فراداده پیدا نشد'};
+  const labels:Record<string,string>={loading:'در حال دریافت وضعیت خزانه…',verified:'اتصال برقرار و فراداده تأیید شد',not_configured:'اتصال تنظیم نشده',unknown:'هنوز بررسی نشده یا نتیجه نامشخص است',unavailable:'خزانه در دسترس نیست',permission_denied:'دسترسی به فراداده رد شد',stale:'بررسی قدیمی',not_found:'فراداده فعال پیدا نشد'};
   return <div className="stack">
     <p role="status">{labels[status.status]??'نامشخص'}{status.checkedAt?' · '+dateLabel(status.checkedAt,{day:'numeric',month:'long',hour:'2-digit',minute:'2-digit'}):''}</p>
     {reference.vaultMount && reference.vaultPath && <dl className="form-grid key-values">
@@ -159,7 +164,7 @@ function VaultMetadata({reference}:{reference:SecretReference}){
     {reference.vaultMount&&<form className="form-stack" onSubmit={verify}>
       <Field label="رمز حساب برای بررسی"><input type="password" name="password" autoComplete="current-password" required /></Field>
       <Field label="کد تازهٔ MFA"><input type="text" name="totp" maxLength={6} inputMode="numeric" autoComplete="one-time-code" /></Field>
-      <Button type="submit" disabled={busy}>بررسی فراداده در Vault</Button>
+      <Button type="submit" disabled={busy || status.status==='loading'}>بررسی فراداده در Vault</Button>
     </form>}
     {error&&<p role="alert">{error}</p>}
   </div>;

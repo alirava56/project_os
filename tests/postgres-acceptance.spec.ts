@@ -1,12 +1,29 @@
 import { createHash } from 'node:crypto';
-import { readFile } from 'node:fs/promises';
+import { execFile, fork } from 'node:child_process';
+import { once } from 'node:events';
+import { createServer } from 'node:https';
+import { promisify } from 'node:util';
+import { localProvider, providerFixtureEnv, reply } from '../scripts/test-provider-http.mjs';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import type { PostgresFixture } from './postgres-fixture';
 import { expect, type Page } from '@playwright/test';
-import { setupToken, test } from './isolated-app';
+import { setupToken, startTestApp, test } from './isolated-app';
 import { totp } from '../src/lib/server/mfa';
 
 const email = 'local-owner@example.test';
 const password = 'synthetic-local-acceptance-password';
 const workspace = 'فضای آزمایشی پذیرش';
+
+async function startFreshPostgresApp(postgres:PostgresFixture,vault?:Parameters<typeof startTestApp>[0]['vault']) {
+  const area=await mkdtemp(join(tmpdir(),'projectos-restart-'));
+  const remove=() => rm(area,{recursive:true,force:true,maxRetries:5});
+  try {
+    const started=await startTestApp({sqlitePath:join(area,'unused.sqlite'),postgresUrl:postgres.url,postgresScopeKey:postgres.scopeKey,vault});
+    return {url:started.url,async stop() { try { await started.stop(); } finally { await remove(); } }};
+  } catch (error) { await remove(); throw error; }
+}
 
 async function signIn(page: Page, address: string, secret: string) {
   await page.getByLabel('ایمیل', {exact:true}).fill(address);
@@ -253,4 +270,222 @@ test.describe('mandatory MFA in the browser', () => {
     await expect(page).toHaveURL(/\/dashboard$/);
     expect((await page.request.post('/api/auth/login',{headers:origin,data:{email,password,recoveryCode:recovery[0]}})).status()).toBe(401);
   });
+});
+
+test('restricted PostgreSQL reminder workers retry Telegram and email, then expose persistent status in Persian', async ({
+  page, browser, origin, postgresFixture, testApp,
+}) => {
+  test.setTimeout(75_000);
+  if (!postgresFixture) throw new Error('PostgreSQL is required');
+  expect((await page.request.get('/api/notifications')).status()).toBe(401);
+  expect((await page.request.post('/api/auth/setup',{headers:origin,data:{
+    setupToken,email,password,displayName:'مالک آزمایشی',workspace,
+  }})).status()).toBe(200);
+  const project={id:'notification-fixture',name:'پروژهٔ اعلان آزمایشی',subtitle:'',coverTitle:'اعلان',description:'',
+    status:'building',type:'وب‌سایت',progress:0,next:'',art:'navigation/projects'};
+  expect((await page.request.post('/api/records/projects/'+project.id,{headers:origin,data:{version:0,record:project}})).status()).toBe(200);
+  const workspaceId=(await postgresFixture.query<{id:string}>('SELECT id FROM workspaces')).rows[0].id;
+
+  const title='یادآوری ارسال آزمایشی';
+  await page.goto('/calendar');
+  await page.getByRole('button',{name:'رویداد جدید',exact:true}).click();
+  const form=page.getByRole('dialog');
+  await form.getByLabel('عنوان رویداد',{exact:true}).fill(title);
+  await form.getByLabel('پروژه',{exact:true}).selectOption(project.id);
+  await form.getByLabel('منطقهٔ زمانی',{exact:true}).selectOption('UTC');
+  const due=new Date(Date.now()+86_400_000).toISOString().slice(0,10);
+  await form.getByLabel('موعد (میلادی)',{exact:true}).fill(due);
+  await form.getByLabel('اعلان (روز قبل از موعد)',{exact:true}).fill('2');
+  await form.getByRole('button',{name:'ثبت رویداد',exact:true}).click();
+  await expect(form).toHaveCount(0);
+  const {rows:[record]}=await postgresFixture.query<{id:string;payload:string}>(
+    "SELECT id,payload FROM records WHERE workspace_id=$1 AND kind='reminders'",[workspaceId]);
+  expect(JSON.parse(record.payload)).toMatchObject({title,due,noticeDays:2});
+
+  const calls: {channel:string;key:string | undefined;body:unknown}[] = [];
+  const mock=await localProvider((request,response,body) => {
+    const channel=request.url === '/emails' ? 'email' : 'telegram';
+    calls.push({channel,key:request.headers['idempotency-key']?.toString(),body});
+    if (calls.filter(call => call.channel===channel).length===1) {
+      reply(response,429,{ok:false,error_code:429,parameters:{retry_after:35}},{'Retry-After':'35'});
+    } else if (channel==='email') reply(response,200,{id:'be542d47-c48b-4765-9f0a-3ee485ce16db'});
+    else reply(response,200,{ok:true,result:{message_id:57}});
+  });
+  try {
+    const run=promisify(execFile);
+    const workerEnv=(url:string) => ({
+      ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^PROJECTOS_|^PG/i.test(key))),
+      ...providerFixtureEnv,NODE_ENV:'test' as const,PROJECTOS_DATABASE_URL:url,PROJECTOS_DATABASE_MODE:'postgres',PROJECTOS_NOTIFICATION_WORKSPACE:workspaceId,
+    });
+    const [reminderUrl,deliveryUrl]=await Promise.all([
+      postgresFixture.provisionWorker('reminder',workspaceId),postgresFixture.provisionWorker('delivery',workspaceId),
+    ]);
+    const schedule=() => run(process.execPath,['scripts/run-reminders.mjs'],{env:workerEnv(reminderUrl),timeout:15_000});
+    await Promise.all([schedule(),schedule()]);
+    const outbox=() => postgresFixture.query<{id:string;state:string;channel:string;attempts:number;retry_after:string}>(
+      `SELECT o.id,o.state,o.channel,COALESCE(r.attempts,0) AS attempts,r.retry_after
+      FROM notification_outbox o LEFT JOIN delivery_retries r ON o.id=r.notification_id WHERE o.workspace_id=$1 ORDER BY o.channel`,[workspaceId]);
+    const initial=(await outbox()).rows;
+    expect(initial.map(row => [row.channel,row.state])).toEqual([['email','pending'],['in_app','available'],['telegram','pending']]);
+    const alert=initial.find(job => job.channel==='in_app')!.id;
+    const deliver=(advance:number) => run(process.execPath,['--input-type=module','-e',`
+      import { closeDatabase, requireWorkerWorkspace } from './scripts/database.mjs';
+      import { configuredChannels, deliverNotifications } from './scripts/notification-delivery.mjs';
+      const workspace=process.env.PROJECTOS_NOTIFICATION_WORKSPACE;
+      const origin=new URL(process.argv[1]);
+      const clock=() => Date.now()+Number(process.argv[2]);
+      if (origin.protocol!=='http:' || origin.hostname!=='127.0.0.1') throw new Error('Loopback fixture required');
+      const send=(url,options) => {
+        const target=new URL(url);
+        if (!['https://api.resend.com','https://api.telegram.org'].includes(target.origin)) throw new Error('Unexpected fixture provider');
+        return fetch(origin.origin + target.pathname,options);
+      };
+      try {
+        await requireWorkerWorkspace('delivery',workspace);
+        await deliverNotifications(workspace,configuredChannels(process.env,send),30,clock);
+      } finally { await closeDatabase(); }
+    `,mock.origin,String(advance)],{env:workerEnv(deliveryUrl),timeout:15_000});
+    await Promise.all([deliver(0),deliver(0)]);
+    expect(calls.map(call => call.channel).sort()).toEqual(['email','telegram']);
+    const path='/api/notifications?alert='+alert;
+    const retry=await page.request.get(path);
+    expect(retry.status()).toBe(200);
+    expect((await retry.json()).delivery).toEqual(expect.arrayContaining([
+      expect.objectContaining({channel:'email',status:'retrying',retryAt:expect.any(String)}),
+      expect.objectContaining({channel:'telegram',status:'retrying',retryAt:expect.any(String)}),
+    ]));
+    expect(retry.headers()['cache-control']).toBe('private, no-store');
+    await deliver(36_000);
+    expect(calls).toHaveLength(4);
+    expect(calls.filter(call => call.channel==='email').map(call => call.key)).toEqual([initial[0].id,initial[0].id]);
+    expect(JSON.stringify(calls.find(call => call.channel==='telegram')?.body)).toContain(project.name);
+    expect(JSON.stringify(calls.find(call => call.channel==='email')?.body)).not.toContain(project.name);
+    expect((await outbox()).rows.filter(row => row.channel!=='in_app').map(row => [row.state,row.attempts]))
+      .toEqual([['delivered',2],['delivered',2]]);
+
+    const supervisor=fork('scripts/local-workers.mjs',[],{stdio:['ignore','pipe','pipe','ipc'],env:{
+      ...workerEnv(reminderUrl),PROJECTOS_LOCAL_REMINDER_DATABASE_URL:reminderUrl,
+      PROJECTOS_TELEGRAM_NOTIFICATIONS:'disabled',PROJECTOS_EMAIL_NOTIFICATIONS:'disabled',
+    }});
+    const stopped=once(supervisor,'exit');
+    let output='';
+    supervisor.stdout?.on('data',chunk=> { output+=String(chunk); });
+    supervisor.stderr?.resume();
+    try { await expect.poll(() => output,{timeout:10_000}).toContain('"workerStatus":"ready"'); }
+    finally {
+      if (supervisor.connected) supervisor.send('stop');
+      expect((await stopped)[0]).toBe(0);
+    }
+    const health=await (await page.request.get('/api/notifications')).json();
+    expect(health.workers).toEqual(expect.arrayContaining([
+      expect.objectContaining({name:'reminders',status:'recent'}),
+    ]));
+    const otherProject={...project,id:'notification-other-project',name:'پروژهٔ دیگر'};
+    const state=await (await page.request.get('/api/state')).json();
+    expect((await page.request.post('/api/records/projects/'+otherProject.id,{headers:origin,data:{
+      version:state.version,record:otherProject,
+    }})).status()).toBe(200);
+    const viewerEmail='notification-viewer@example.test';
+    const invited=await page.request.post('/api/team/invitations',{headers:origin,data:{
+      email:viewerEmail,role:'viewer',projectIds:[otherProject.id],
+    }});
+    expect(invited.status()).toBe(200);
+    const viewer=await browser.newContext({baseURL:origin.Origin,ignoreHTTPSErrors:origin.Origin.startsWith('https:')});
+    try {
+      expect((await viewer.request.post('/api/auth/accept-invite',{headers:origin,data:{
+        email:viewerEmail,password,displayName:'بینندهٔ آزمایشی',token:(await invited.json()).token,
+      }})).status()).toBe(200);
+      expect((await viewer.request.get(path)).status()).toBe(404);
+      expect((await viewer.request.get('/api/notifications')).status()).toBe(404);
+    } finally { await viewer.close(); }
+    const storageState=await page.context().storageState();
+    await testApp.stop();
+    const restarted=await startFreshPostgresApp(postgresFixture);
+    const view=await browser.newContext({baseURL:restarted.url,ignoreHTTPSErrors:restarted.url.startsWith('https:'),storageState});
+    try {
+      const accepted=await view.request.get(path);
+      expect(accepted.status()).toBe(200);
+      const payload=await accepted.json();
+      expect(payload.delivery.filter((job:{status:string}) => job.status==='accepted')).toHaveLength(2);
+      expect(JSON.stringify(payload)).not.toMatch(/provider_id|lease_token|synthetic_mock|example\.test/);
+      const fresh=await view.newPage();
+      await fresh.goto('/alerts');
+      await fresh.getByRole('button',{name:new RegExp(title)}).click();
+      const dialog=fresh.getByRole('dialog');
+      await expect(dialog.getByRole('list',{name:'وضعیت ارسال اعلان'}).getByText('پذیرفته‌شده توسط ارائه‌دهنده',{exact:false})).toHaveCount(2);
+      await expect(fresh.locator('html')).toHaveAttribute('dir','rtl');
+    } finally { await view.close(); await restarted.stop(); }
+  } finally { await mock.close(); }
+});
+
+test('configured Vault metadata is verified through trusted TLS without exposing provider data', async ({page,browser,origin,postgresFixture,testApp}) => {
+  test.setTimeout(60_000);
+  if (!postgresFixture || !process.env.PROJECTOS_TEST_TLS_KEY || !process.env.PROJECTOS_TEST_TLS_CERT) {
+    throw new Error('PostgreSQL and the generated loopback TLS fixture are required');
+  }
+  const key=await readFile(process.env.PROJECTOS_TEST_TLS_KEY);
+  const cert=await readFile(process.env.PROJECTOS_TEST_TLS_CERT);
+  expect((await page.request.post('/api/auth/setup',{headers:origin,data:{
+    setupToken,email,password,displayName:'مالک آزمایشی',workspace,
+  }})).status()).toBe(200);
+  const project={id:'vault-fixture',name:'پروژهٔ خزانه',subtitle:'',coverTitle:'خزانه',description:'',
+    status:'building',type:'وب‌سایت',progress:0,next:'',art:'navigation/projects'};
+  expect((await page.request.post('/api/records/projects/'+project.id,{headers:origin,data:{version:0,record:project}})).status()).toBe(200);
+  const workspaceId=(await postgresFixture.query<{id:string}>('SELECT id FROM workspaces')).rows[0].id;
+  const reference={id:'fixture-vault-reference',projectId:project.id,name:'فرادادهٔ ساختگی',
+    type:'SSH Key',vaultProvider:'HashiCorp Vault',vaultMount:'fixture-kv',vaultPath:'project/fixture'};
+  const saved=await page.request.post('/api/records/secrets/'+reference.id,{headers:origin,data:{version:1,record:reference}});
+  expect(saved.status()).toBe(200);
+  const token='synthetic.vault.fixture.only';
+  const ignored='SYNTHETIC_ONLY_PROVIDER_FIELD';
+  const received:{path:string | undefined;method:string | undefined;authorized:boolean}[]=[];
+  let code=200;
+  const vault=createServer({key,cert},(request,response) => {
+    received.push({path:request.url,method:request.method,authorized:request.headers['x-vault-token']===token});
+    reply(response,code,{data:{current_version:5,versions:{5:{destroyed:false,deletion_time:''}},custom_metadata:{ignored}}});
+  });
+  vault.listen(0,'127.0.0.1');
+  await once(vault,'listening');
+  const address=vault.address();
+  if (!address || typeof address === 'string') throw new Error('Missing Vault test endpoint');
+  try {
+    const storageState=await page.context().storageState();
+    await testApp.stop();
+    const configured=await startFreshPostgresApp(postgresFixture,
+      {workspace:workspaceId,token,ca:process.env.PROJECTOS_TEST_TLS_CERT,origin:'https://127.0.0.1:'+address.port});
+    const client=await browser.newContext({baseURL:configured.url,ignoreHTTPSErrors:true,storageState});
+    try {
+      const headers={Origin:configured.url,'Sec-Fetch-Site':'same-origin'};
+      const path='/api/vault/'+reference.id;
+      expect((await client.request.post(path,{headers,data:{password,value:ignored}})).status()).toBe(400);
+      expect(received).toHaveLength(0);
+      const checked=await client.request.post(path,{headers,data:{password}});
+      expect(checked.status()).toBe(200);
+      expect(await checked.json()).toEqual({status:'verified',providerVersion:5,checkedAt:expect.any(String)});
+      expect(received).toEqual([{path:'/v1/fixture-kv/metadata/project/fixture',method:'GET',authorized:true}]);
+      const meta=await postgresFixture.query('SELECT status,provider_version FROM vault_checks WHERE workspace_id=$1',[workspaceId]);
+      expect(meta.rows).toEqual([{status:'verified',provider_version:5}]);
+      const stored=await postgresFixture.query('SELECT payload FROM records WHERE workspace_id=$1',[workspaceId]);
+      expect(JSON.stringify(stored.rows)).not.toContain(ignored);
+      expect(await (await client.request.get(path)).text()).not.toContain(token);
+      code=403;
+      expect(await (await client.request.post(path,{headers,data:{password}})).json())
+        .toEqual({status:'permission_denied',providerVersion:null,checkedAt:expect.any(String)});
+      const editorEmail='vault-editor@example.test';
+      const invited=await client.request.post('/api/team/invitations',{headers,data:{email:editorEmail,role:'editor',projectIds:[project.id]}});
+      expect(invited.status()).toBe(200);
+      const editor=await browser.newContext({baseURL:configured.url,ignoreHTTPSErrors:true});
+      try {
+        expect((await editor.request.post('/api/auth/accept-invite',{headers,data:{
+          email:editorEmail,password,displayName:'ویرایشگر آزمایشی',token:(await invited.json()).token,
+        }})).status()).toBe(200);
+        expect((await editor.request.get(path)).status()).toBe(404);
+        expect((await editor.request.post(path,{headers,data:{password}})).status()).toBe(404);
+        expect(received).toHaveLength(2);
+      } finally { await editor.close(); }
+    } finally { await client.close(); await configured.stop(); }
+  } finally {
+    vault.closeAllConnections();
+    await new Promise<void>(resolve=>vault.close(()=>resolve()));
+  }
 });

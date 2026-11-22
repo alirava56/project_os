@@ -23,6 +23,7 @@ const migrations = [
   ['019_live_workspace_scope', new URL('../schema/postgres/019_live_workspace_scope.sql', import.meta.url)],
   ['020_record_projection', new URL('../schema/postgres/020_record_projection.sql', import.meta.url)],
   ['021_private_role_boundaries', new URL('../schema/postgres/021_private_role_boundaries.sql', import.meta.url)],
+  ['022_notification_lifecycle', new URL('../schema/postgres/022_notification_lifecycle.sql', import.meta.url)],
 ];
 const client = await getPostgresPool().connect();
 try {

@@ -7,6 +7,7 @@ const { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } = require('
 const { tmpdir } = require('node:os');
 const { join } = require('node:path');
 const { Readable } = require('node:stream');
+const { once } = require('node:events');
 const { promisify } = require('node:util');
 const ts = require('typescript');
 const { Client } = require('pg');
@@ -658,6 +659,40 @@ test('SQLite to PostgreSQL preserves data and identity; transactional rollback, 
     assert.equal(await sql.one("SELECT id FROM notification_outbox WHERE id='hidden-delivery'"),undefined);
     await assert.rejects(sql.run("UPDATE notification_outbox SET delivered_at=now()"),{code:'42501'});
     await assert.rejects(sql.all('SELECT id FROM users'),{code:'42501'});
+    const faultAdmin=new Client({connectionString:connectionFor(ledgerRestore)});
+    await faultAdmin.connect();
+    try {
+      const {reminderAlertId}=await import('./reminder-scheduler.mjs');
+      const fixture={id:'transaction-reminder',title:'Synthetic transaction reminder',projectId:'alpha',
+        kind:'یادآوری',due:'2031-03-06',zone:'UTC',noticeDays:0};
+      await faultAdmin.query(`INSERT INTO records(workspace_id,kind,id,project_id,payload,updated_at)
+        VALUES($1,'reminders',$2,'alpha',$3,$4)`,[owner.workspaceId,fixture.id,JSON.stringify(fixture),stamp]);
+      const incident=reminderAlertId(owner.workspaceId,fixture.kind,fixture.id,fixture.due,'reminders');
+      assert.match(incident,/^auto-[a-f0-9]{28}$/);
+      const version=async () => (await faultAdmin.query('SELECT version FROM workspaces WHERE id=$1',[owner.workspaceId])).rows[0].version;
+      const previous=await version();
+      await faultAdmin.query("ALTER TABLE notification_outbox ADD CONSTRAINT test_reject_reminder CHECK (id <> '"+incident+"')");
+      try {
+        await assert.rejects(scan('2031-03-06T10:00:00Z'),{code:'23514'});
+        assert.equal((await faultAdmin.query("SELECT id FROM records WHERE kind='incidents' AND id=$1",[incident])).rowCount,0);
+        assert.equal((await faultAdmin.query('SELECT id FROM notification_outbox WHERE id=$1',[incident])).rowCount,0);
+        assert.equal(await version(),previous);
+      } finally { await faultAdmin.query('ALTER TABLE notification_outbox DROP CONSTRAINT test_reject_reminder'); }
+      const session=await getPostgresPool().connect();
+      try {
+        await session.query('BEGIN');
+        const {pid}=(await session.query('SELECT pg_backend_pid() AS pid')).rows[0];
+        await session.query('UPDATE workspaces SET version=version+1 WHERE id=$1',[owner.workspaceId]);
+        const disconnected=once(session,'error');
+        const result=await faultAdmin.query('SELECT pg_terminate_backend($1) AS stopped',[pid]);
+        assert.equal(result.rows[0].stopped,true);
+        assert.equal((await disconnected)[0].code,'57P01');
+      } finally { session.release(true); }
+      assert.equal(await version(),previous);
+      await closeDatabase();
+      await scan('2031-03-06T10:00:00Z');
+      assert.equal((await faultAdmin.query('SELECT id FROM notification_outbox WHERE id=$1',[incident])).rowCount,1);
+    } finally { await faultAdmin.end(); }
   } finally {
     await closeDatabase();
     for (const db of created.reverse()) await admin.query('DROP DATABASE "' + db + '"');

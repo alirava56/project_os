@@ -1,5 +1,6 @@
 \set ON_ERROR_STOP on
 BEGIN;
+SELECT pg_advisory_xact_lock(3804521);
 
 -- Run as the schema owner. Supply an existing dedicated login via -v runtime_role=...
 SELECT set_config('projectos.install_runtime_role', :'runtime_role', true);
@@ -33,5 +34,7 @@ GRANT SELECT ON monitor_observations TO :"runtime_role";
 SELECT projectos_private.grant_identity_runtime(:'runtime_role');
 SELECT projectos_private.grant_workspace_runtime(:'runtime_role');
 SELECT projectos_private.grant_record_projection(:'runtime_role');
+GRANT EXECUTE ON FUNCTION public.projectos_notification_status(text), public.projectos_notification_health(),
+  public.projectos_retire_explicit_reminder(text) TO :"runtime_role";
 
 COMMIT;

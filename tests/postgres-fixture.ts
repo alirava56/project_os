@@ -31,11 +31,13 @@ export async function createPostgresFixture() {
   const admin = new PgClient({connectionString:cluster.href});
   let databaseCreated = false;
   let roleCreated = false;
+  const workerRoles = new Set<string>();
   async function dispose() {
     try {
       if (databaseCreated) await admin.query(`DROP DATABASE "${database}"`);
     } finally {
       try {
+        for (const worker of workerRoles) await admin.query(`DROP ROLE "${worker}"`);
         if (roleCreated) await admin.query(`DROP ROLE "${role}"`);
       } finally { await admin.end(); }
     }
@@ -65,7 +67,22 @@ export async function createPostgresFixture() {
       env:{...env,PGPASSWORD:decodeURIComponent(cluster.password)}, timeout:30_000,
     });
     await query('INSERT INTO projectos_private.scope_key(singleton,secret) VALUES(true,decode($1,\'hex\'))',[scopeKey]);
-    return {url:webUrl.href, scopeKey, query, dispose};
+    async function provisionWorker(kind: 'reminder' | 'delivery', workspace: string) {
+      const login = 'projectos_' + kind + '_' + suffix;
+      const secret = randomBytes(24).toString('hex');
+      await admin.query(`CREATE ROLE "${login}" LOGIN PASSWORD '${secret}'`);
+      workerRoles.add(login);
+      await exec(psql,['-X','-h',cluster.hostname,'-p',cluster.port || '5432','-U',decodeURIComponent(cluster.username),
+        '-d',database,'-v',kind + '_role=' + login,'-v','workspace_id=' + workspace,
+        '-f',resolve('schema/postgres/grant-' + kind + '.sql')],{
+        env:{...env,PGPASSWORD:decodeURIComponent(cluster.password)},timeout:30_000,
+      });
+      const connection = new URL(ownerUrl);
+      connection.username = login;
+      connection.password = secret;
+      return connection.href;
+    }
+    return {url:webUrl.href, scopeKey, query, dispose, provisionWorker};
   } catch (error) {
     await dispose();
     throw error;
