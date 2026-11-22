@@ -3,6 +3,7 @@ import { getCurrentAccount } from '@/lib/server/auth';
 import { loadState, projectPolicy, readTransaction } from '@/lib/server/db';
 import { apiError, noStore } from '@/lib/server/http';
 import { validRecordId } from '@/lib/record-contract';
+import { sampledAvailability } from '@/lib/slo';
 import { machineObservationFresh, type MachineObservation } from '@/lib/monitoring';
 
 export const runtime = 'nodejs';
@@ -19,9 +20,9 @@ export async function GET(request: NextRequest) {
   const params = resourceId ? [account.workspaceId, resourceId] : [account.workspaceId];
   const [rows, machineRows] = await readTransaction(async db => {
     await projectPolicy(db, account);
-    const observations = await db.all<{resourceId: string; checkedAt: string; state: string; statusCode: number | null; latencyMs: number | null; source: string; tlsExpiresAt: string | null}>(
+    const observations = await db.all<{resourceId: string; checkedAt: string; state: string; statusCode: number | null; latencyMs: number | null; source: string; tlsExpiresAt: string | null; diagnostic:string}>(
       `SELECT resource_id AS "resourceId",checked_at AS "checkedAt",state,status_code AS "statusCode",
-        latency_ms AS "latencyMs",source,tls_expires_at AS "tlsExpiresAt"
+        latency_ms AS "latencyMs",source,diagnostic,tls_expires_at AS "tlsExpiresAt"
         FROM monitor_observations WHERE workspace_id=?` + filter + ' ORDER BY checked_at DESC LIMIT 200',...params);
     const machine = await db.all<Omit<MachineObservation,'source'|'state'>>(
       `SELECT resource_id AS "resourceId",checked_at AS "checkedAt",cpu_percent AS "cpuPercent",
@@ -35,11 +36,13 @@ export async function GET(request: NextRequest) {
   const observations = rows.filter(row => allowed.has(row.resourceId)).map(row => {
     const age = now - Date.parse(row.checkedAt);
     const state = Number.isFinite(age) && age >= -60_000 && age <= freshnessWindowMinutes * 60_000 ? row.state : 'stale';
-    return {...row, state, recordedState: row.state};
+    const diagnostic=['dns','timeout','tls','connection','unavailable'].includes(row.diagnostic) ? row.diagnostic : null;
+    return {...row, diagnostic, state, recordedState: row.state};
   });
   const machineObservations = machineRows.filter(row => allowed.has(row.resourceId)).map(row => {
     return {...row,source:'machine-agent',state:machineObservationFresh(row.checkedAt,now)?'observed':'stale'};
   });
   const status = observations.length || machineObservations.length || process.env.PROJECTOS_MONITOR_HOSTS ? 'configured' : 'not_configured';
-  return NextResponse.json({ observations, machineObservations, status, freshnessWindowMinutes }, { headers: noStore });
+  const availability = sampledAvailability(observations.map(row=>({...row,state:row.recordedState})),now);
+  return NextResponse.json({ observations, machineObservations, status, freshnessWindowMinutes, availability }, { headers: noStore });
 }

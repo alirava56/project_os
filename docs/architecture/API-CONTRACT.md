@@ -25,6 +25,8 @@ Application API responses containing workspace or authentication data are privat
 | `/api/assistant` | POST | Permission-aware project sources. External requests require explicit query approval and server opts. Returned model selections must occur verbatim in available sources. `{"intent":"resume","projectId":"alpha"}` returns a local summary with dated links to permitted events, project details and an active task when available. |
 | `/api/health` | GET | Readiness status without identifiers or sensitive metadata. |
 
+`POST /api/exchange-rates/refresh` fetches a configured USD/IRR quote for an Owner-visible project and appends a versioned rate with provider observation and server receipt times. `POST /api/shared-costs` atomically records equal shares for a scoped resource using a client request reference, with one expense per project. Invoice creation accepts an optional immutable `contractId` whose project and currency must match. `/api/monitoring` returns observed HTTPS availability buckets and coverage alongside raw observations.
+
 Vault references may carry an optional `resourceId`. At write time the resource must belong to, or be shared with, the reference project. The record API rejects resource deletion while a Vault reference remains attached. PostgreSQL and SQLite store the optional field in the existing record payload and continue to read earlier references without backfill.
 
 Resources, tasks and reminders accept optional `noticeDays` values from 0 through 60. A resource needs a renewal date when this value is set. Setting a task's lead time opts that task into the deadline scheduler. Older payloads retain their existing schedule semantics without a backfill. The alert states also include `dismissed` and `resolved`.

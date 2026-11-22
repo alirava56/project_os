@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { checkOrigin, getCurrentAccount, rateLimit, readLimitedJson } from '@/lib/server/auth';
 import { canSeeProject, projectPolicy, sql, loadRecord, readTransaction, transaction, type Account } from '@/lib/server/db';
 import { apiError, jsonError, noStore } from '@/lib/server/http';
-import { githubBindings, syncRepository, type RepositoryBinding, type RepositorySnapshot } from '@/lib/server/github';
+import { githubBindings, retainRepositorySnapshot, syncRepository, type RepositoryBinding, type RepositorySnapshot } from '@/lib/server/github';
 import { validRecordId } from '@/lib/record-contract';
 
 export const runtime = 'nodejs';
@@ -65,12 +65,19 @@ export async function POST(request: NextRequest) {
   if (previous?.retryAt && Date.parse(previous.retryAt) > Date.now()) return apiError('Rate limited by GitHub', 429,
     {'Retry-After':String(Math.ceil((Date.parse(previous.retryAt) - Date.now())/1000))});
   const next = await syncRepository(repository, token, fetch, new Date(), backfill===true);
-  await transaction(async db => {
+  const saved = await transaction(async db => {
     await projectPolicy(db, account);
+    const lock=db.dialect==='postgres'?' FOR UPDATE':'';
+    const current=await db.one<{checked_at:string;payload:string}>(`SELECT checked_at,payload FROM github_snapshots
+      WHERE workspace_id=? AND project_id=? AND repo=?`+lock,account.workspaceId,projectId,repository);
+    const stored=current ? JSON.parse(current.payload) as RepositorySnapshot : undefined;
+    if (current && Date.parse(current.checked_at)>Date.parse(next.checkedAt)) return stored;
+    const merged=retainRepositorySnapshot(next,stored);
     await db.run(`INSERT INTO github_snapshots(workspace_id,project_id,repo,checked_at,status,payload) VALUES(?,?,?,?,?,?)
       ON CONFLICT(workspace_id,project_id,repo) DO UPDATE SET checked_at=excluded.checked_at,status=excluded.status,payload=excluded.payload
       WHERE github_snapshots.checked_at<=excluded.checked_at`,
-    account.workspaceId, projectId, repository, next.checkedAt, next.state, JSON.stringify(next));
+    account.workspaceId, projectId, repository, merged.checkedAt, merged.state, JSON.stringify(merged));
+    return merged;
   });
-  return NextResponse.json({ ...next,projectId }, {headers:noStore});
+  return NextResponse.json({ ...saved,projectId }, {headers:noStore});
 }

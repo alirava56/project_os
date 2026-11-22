@@ -2,9 +2,10 @@
 
 import { useEffect, useState } from 'react';
 import { Activity, Bell, Check, CircleAlert, Clock3, Radio, RefreshCw } from 'lucide-react';
-import { afterHours, dateLabel, matches, resourceHref } from '@/lib/format';
+import { afterHours, dateLabel, matches, number, resourceHref } from '@/lib/format';
 import { choices, incidentStates, priorities, priorityTones } from '@/lib/labels';
 import { machineObservationFresh, type MachineObservation } from '@/lib/monitoring';
+import { availabilityTarget, type sampledAvailability } from '@/lib/slo';
 import { savePreferences, useDemo } from '@/lib/store';
 import type { Incident } from '@/lib/types';
 import { ProjectFilter, projectName } from './forms';
@@ -14,8 +15,9 @@ import { Button, Callout, Empty, Filter, Heading, Metrics, Modal, Panel, Pill, R
 export function Monitoring() {
   const { data }=useDemo();
   const [query,setQuery]=useState('');
-  const [observations,setObservations]=useState<Array<{resourceId:string;checkedAt:string;state:string;statusCode:number|null;latencyMs:number|null;tlsExpiresAt:string|null}>>([]);
+  const [observations,setObservations]=useState<Array<{resourceId:string;checkedAt:string;state:string;statusCode:number|null;latencyMs:number|null;tlsExpiresAt:string|null;diagnostic:string|null}>>([]);
   const [machine,setMachine]=useState<MachineObservation[]>([]);
+  const [availability,setAvailability]=useState<ReturnType<typeof sampledAvailability>>([]);
   const [monitorStatus,setMonitorStatus]=useState<'loading'|'not_configured'|'configured'|'error'>('loading');
   const [requestCycle,setRequestCycle]=useState(0);
   const [range,setRange]=useState('day');
@@ -28,6 +30,7 @@ export function Monitoring() {
       if(cancelled)return;
       setObservations(Array.isArray(payload.observations)?payload.observations:[]);
       setMachine(Array.isArray(payload.machineObservations)?payload.machineObservations:[]);
+      setAvailability(Array.isArray(payload.availability)?payload.availability:[]);
       setMonitorStatus(payload.status==='configured'?'configured':'not_configured');
     }).catch(()=>{if(!cancelled)setMonitorStatus('error');});
     return ()=>{cancelled=true;};
@@ -43,6 +46,7 @@ export function Monitoring() {
     const observation=latest.get(id);
     return observation&&Number.isFinite(Date.parse(observation.checkedAt))&&clock-Date.parse(observation.checkedAt)>=-60_000&&clock-Date.parse(observation.checkedAt)<=15*60*1000&&observation.state!=='stale'?observation:undefined;
   };
+  const diagnosticLabels:Record<string,string>={dns:'خطای DNS',tls:'خطای TLS',timeout:'مهلت پاسخ تمام شد',connection:'خطای اتصال',unavailable:'بررسی ناموفق'};
   const stateLabel=(state:string)=>({healthy:'HTTPS پاسخ‌گو',unhealthy:'HTTPS ناموفق',stale:'مشاهدهٔ قدیمی'}[state] ?? 'وضعیت نامشخص');
   const unknown=data.resources.filter(r=>!fresh(r.id)).length;
   const resources=data.resources.filter(r=>matches(query,r.name,r.address,r.provider));
@@ -81,11 +85,22 @@ export function Monitoring() {
         <div className="stack">{visibleObservations.slice(0,12).map((o,index)=><Row key={`${o.resourceId}-${o.checkedAt}-${index}`} icon={Activity}
           title={data.resources.find(r=>r.id===o.resourceId)?.name??'منبع'}
           meta={<>{dateLabel(o.checkedAt,{year:'numeric',month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})} · کد {o.statusCode??'نامشخص'} · {o.latencyMs??'—'} ms
+            {o.diagnostic && diagnosticLabels[o.diagnostic] && <> · {diagnosticLabels[o.diagnostic]}</>}
             {o.tlsExpiresAt?' · انقضای TLS '+dateLabel(o.tlsExpiresAt):''}</>}
           end={<Pill tone={o.state==='healthy'&&fresh(o.resourceId)?.checkedAt===o.checkedAt?'good':'warn'}>{stateLabel(
             clock-Date.parse(o.checkedAt)>15*60*1000 ? 'stale' : o.state,
           )}</Pill>}/>)}</div>:
         <Empty title="در این بازه مشاهده‌ای ثبت نشده است"/>}</Panel>
+      <Panel title="دسترس‌پذیری نمونه‌برداری‌شده و بودجهٔ خطا">
+        <p className="muted">هدف {number(availabilityTarget)}٪ در ۲۴ ساعت گذشته. پوشش با بازه‌های ۱۵ دقیقه‌ای سنجیده می‌شود.</p>
+        {monitorStatus==='configured' && availability.length ? availability.map(item=><Row key={item.resourceId} icon={Activity}
+          title={data.resources.find(resource=>resource.id===item.resourceId)?.name ?? 'منبع'}
+          meta={number(item.covered)+' از '+number(item.expected)+' بازه مشاهده شده · '+number(item.failed)+' بازه ناموفق'}
+          end={<Pill tone={item.covered===item.expected && item.errorBudgetRemaining>=0?'good':'warn'}>
+            {number(item.availability)}٪ · {item.covered===item.expected
+              ? number(item.errorBudgetRemaining)+' بازه بودجهٔ باقی‌مانده' : 'پوشش ناکافی برای ارزیابی بودجه'}
+          </Pill>}/>) : <Empty title={monitorStatus==='loading'?'در حال دریافت مشاهدات':'مشاهدهٔ معتبر برای محاسبه ثبت نشده است'}/>}
+      </Panel>
       <Panel title="آخرین گزارش‌های عامل میزبان">
         {machine.length?machine.slice(0,10).map(o=><Row key={o.resourceId+o.checkedAt} icon={Activity}
           title={data.resources.find(r=>r.id===o.resourceId)?.name??'منبع'}

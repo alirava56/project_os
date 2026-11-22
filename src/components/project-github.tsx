@@ -40,6 +40,7 @@ export function ProjectGitHub({ projectId }: { projectId: string }) {
         </a>
         <Pill tone={repo.state==='connected'?'good':'neutral'}>{states[repo.state] ?? states.unknown}</Pill>
         <small className="muted">آخرین بررسی API · {time(repo.checkedAt)}</small>
+        {repo.state!=='connected' && repo.lastSuccessfulAt && <small className="muted">آخرین دادهٔ موفق · {time(repo.lastSuccessfulAt)}</small>}
       </div>
       {!!repo.commits?.length && <details><summary>Commitها</summary><ul>{repo.commits.map(commit=>
         <li key={commit.sha}><bdi>{commit.subject}</bdi> · <bdi dir="ltr">{commit.sha.slice(0,8)}</bdi> · {time(commit.committedAt)}</li>

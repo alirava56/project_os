@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import assert from 'node:assert/strict';
 import pg from 'pg';
+import {localProvider,reply} from './test-provider-http.mjs';
 
 const adminUrl = new URL(process.env.PROJECTOS_TEST_POSTGRES_URL ?? 'file:/');
 if (!['postgres:', 'postgresql:'].includes(adminUrl.protocol) || !['127.0.0.1','localhost'].includes(adminUrl.hostname)
@@ -18,10 +19,17 @@ const runtimePassword = randomBytes(24).toString('hex');
 const scratch = await mkdtemp(join(tmpdir(),'projectos-pg-http-'));
 const admin = new pg.Client({connectionString:adminUrl.href});
 const setupToken = 'synthetic-runtime-test-bootstrap-token';
-let server, existed = false, roleCreated = false;
+let server, currencyMock, existed = false, roleCreated = false;
 
-async function startServer(env) {
-  server = fork(resolve('scripts/prepare-e2e.mjs'),[],{env,stdio:['ignore','ignore','pipe','ipc']});
+async function startServer(env, fixtureOrigin) {
+  const code=fixtureOrigin ? `const origin=${JSON.stringify(fixtureOrigin)};
+    const send=globalThis.fetch;
+    globalThis.fetch=(input,options)=>{
+      const url=new URL(typeof input==='string' ? input : input.url ?? input);
+      return send(url.origin==='https://api.currencyapi.com' ? origin+url.pathname+url.search : input,options);
+    };` : '';
+  const hook='data:text/javascript;base64,'+Buffer.from(code).toString('base64');
+  server = fork(resolve('scripts/prepare-e2e.mjs'),[],{env,execArgv:fixtureOrigin?['--import',hook]:[],stdio:['ignore','ignore','pipe','ipc']});
   server.stderr?.resume();
   return new Promise((ok,fail)=>{
     const timeout = setTimeout(()=>fail(new Error('PostgreSQL production build test server not ready')),30_000);
@@ -127,10 +135,18 @@ try {
   await stopServer();
   const agentToken='synthetic-runtime-monitor-agent-fixture-only';
   const webhookSecret=randomBytes(32).toString('hex');
+  let quoteRequests=0, providerCode=503;
+  currencyMock=await localProvider((request,response)=>{
+    quoteRequests++;
+    assert.equal(request.url,'/v3/latest?base_currency=USD&currencies=IRR');
+    assert.equal(request.headers.apikey,'synthetic-gate-d-currency');
+    reply(response,providerCode,{meta:{last_updated_at:new Date(Date.now()-60_000).toISOString()},data:{IRR:{code:'IRR',value:12345.6789}}});
+  });
   appUrl=await startServer({...env, PROJECTOS_MONITOR_WORKSPACE:workspace,
+    PROJECTOS_CURRENCYAPI_ENABLED:'enabled',PROJECTOS_CURRENCYAPI_KEY:'synthetic-gate-d-currency',
     PROJECTOS_MONITOR_AGENT_TOKEN:agentToken, PROJECTOS_MONITOR_AGENT_RESOURCES:resource.id,
     PROJECTOS_GITHUB_PROJECTS:JSON.stringify(repositories.map(([projectId,repository])=>({workspaceId:workspace,projectId,repository}))),
-    PROJECTOS_GITHUB_TOKEN:'synthetic-binding-fixture',PROJECTOS_GITHUB_WEBHOOK_SECRET:webhookSecret});
+    PROJECTOS_GITHUB_TOKEN:'synthetic-binding-fixture',PROJECTOS_GITHUB_WEBHOOK_SECRET:webhookSecret},currencyMock.origin);
   headers.Origin=appUrl;
   const observe=(body, token=agentToken)=>fetch(appUrl+'/api/monitoring/observations',{
     method:'POST',headers:{'Content-Type':'application/json',Authorization:'Bearer '+token},
@@ -246,6 +262,51 @@ try {
     const state=await (await fetch(appUrl+'/api/state',{headers:session})).json();
     return fetch(appUrl+'/api/records',{headers:scopedHttpHeaders(session),method:'PATCH',body:JSON.stringify({version:state.version,changes})});
   };
+  const finance=(kind,record,action='create')=>({kind,id:record.id,record,action});
+  const agreement={id:'http-agreement',projectId:project.id,title:'Synthetic agreement',client:'Fixture client',
+    start:'2031-01-01',end:'2031-12-31',currency:'USD',amount:1234,amountUnit:'minor',state:'active'};
+  const invoice={id:'http-linked-invoice',projectId:project.id,contractId:agreement.id,title:'Synthetic invoice',
+    reference:'D-100',direction:'receivable',amount:1234,currency:'USD',amountUnit:'minor',state:'open',issuedOn:'2031-01-01',dueOn:'2031-02-01'};
+  assert.equal((await commit([finance('contracts',agreement),finance('invoices',invoice)])).status,200);
+  assert.equal((await commit([finance('invoices',{...invoice,id:'foreign-invoice',projectId:otherProject.id,reference:'D-101'})])).status,422);
+  assert.equal((await commit([finance('invoices',{...invoice,id:'wrong-currency',reference:'D-102',currency:'IRR'})])).status,422);
+  assert.equal((await commit([finance('contracts',{...agreement,currency:'IRR'},'replace')])).status,422);
+  assert.equal((await commit([finance('invoices',{...invoice,contractId:undefined},'replace')])).status,422);
+  assert.equal((await fetch(appUrl+'/api/records/invoices/'+invoice.id,{headers:viewerHeaders})).status,404);
+  const payment={id:'partial-http-payment',projectId:project.id,invoiceId:invoice.id,reference:'D-P1',
+    amount:234,currency:'USD',amountUnit:'minor',paidOn:'2031-01-02'};
+  assert.equal((await commit([finance('payments',payment)])).status,200);
+  assert.equal((await commit([finance('payments',{...payment,id:'duplicate-http-payment'})])).status,422);
+  assert.equal((await (await fetch(appUrl+'/api/records/invoices/'+invoice.id,{headers})).json()).record.contractId,agreement.id);
+  const rateRefresh=(session=headers)=>fetch(appUrl+'/api/exchange-rates/refresh',{method:'POST',headers:scopedHttpHeaders(session),
+    body:JSON.stringify({projectId:project.id})});
+  assert.equal((await rateRefresh(viewerHeaders)).status,403);
+  assert.equal((await rateRefresh()).status,503);
+  providerCode=200;
+  const freshQuote=await rateRefresh();
+  assert.equal(freshQuote.status,200);
+  const quote=await freshQuote.json();
+  assert.equal(quote.rate,'12345.6789');
+  assert.ok(quote.receivedAt>quote.observedAt);
+  assert.deepEqual(await (await rateRefresh()).json(),quote);
+  assert.equal(quoteRequests,2);
+  const stamp=new Date().toISOString();
+  const manualRate={id:'manual-gate-d-rate',projectId:project.id,from:'USD',to:'IRR',source:'Fixture manual quote',
+    rate:'50000.01',observedAt:stamp};
+  assert.equal((await commit([finance('exchangeRates',{...manualRate,receivedAt:stamp})])).status,422);
+  assert.equal((await commit([finance('exchangeRates',manualRate)])).status,200);
+  const allocationBody={resourceId:shared.id,title:'Synthetic shared cost',amount:101,currency:'USD',date:'2031-01-01',reference:randomUUID()};
+  const allocate=(session=headers)=>fetch(appUrl+'/api/shared-costs',{method:'POST',headers:scopedHttpHeaders(session),body:JSON.stringify(allocationBody)});
+  assert.equal((await allocate(viewerHeaders)).status,403);
+  const allocations=await Promise.all([allocate(),allocate()]);
+  assert.deepEqual(allocations.map(response=>response.status).sort(),[201,409]);
+  const ownerCosts=(await (await fetch(appUrl+'/api/state',{headers})).json()).data.expenses.filter(expense=>expense.title===allocationBody.title);
+  assert.deepEqual(ownerCosts.map(expense=>expense.amount).sort(),[50,51]);
+  const viewerCosts=(await (await fetch(appUrl+'/api/state',{headers:viewerHeaders})).json()).data.expenses
+    .filter(expense=>expense.title===allocationBody.title);
+  assert.equal(viewerCosts.length,1);
+  assert.equal(viewerCosts[0].projectId,otherProject.id);
+  assert.equal((await commit([finance('expenses',{...ownerCosts[0],amount:99},'replace')])).status,422);
   const makeTask=(id,projectId,dependencies=[])=>({id,projectId,title:id,status:'todo',priority:'medium',
     owner:'',due:'2031-03-01',description:'',checklist:[],comments:[],dependencies});
   const taskChange=(record,action='create')=>({kind:'tasks',id:record.id,record,action});
@@ -350,6 +411,9 @@ try {
   });
   assert.doesNotMatch(migrated,/Applied/);
   appUrl=await startServer(env);
+  const persistedQuote=await fetch(appUrl+'/api/records/exchangeRates/'+quote.id,{headers});
+  assert.equal(persistedQuote.status,200);
+  assert.deepEqual((await persistedQuote.json()).record,quote);
   const restarted=await fetch(appUrl+'/api/records/tasks/'+task.id,{headers});
   assert.equal(restarted.status,200);
   assert.equal((await restarted.json()).record.title,checkpoint.title);
@@ -368,6 +432,7 @@ try {
     sharedResources:'projected',cutover:'acknowledged-commit-and-no-sqlite-fallback'}));
 } finally {
   await stopServer();
+  await currencyMock?.close();
   if (existed) await admin.query('DROP DATABASE "' + database + '"');
   if (roleCreated) await admin.query('DROP ROLE "' + runtimeRole + '"');
   await admin.end();

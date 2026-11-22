@@ -16,6 +16,7 @@ export type RepositorySnapshot = {
   releases?: Array<{tag: string; publishedAt: string | null}>;
   latestDeployment?: {id: number; state: string} | null;
   retryAt?: string;
+  lastSuccessfulAt?: string;
 };
 
 export function githubBindings(value = process.env.PROJECTOS_GITHUB_PROJECTS): RepositoryBinding[] {
@@ -78,6 +79,12 @@ function unique<T>(items:T[], key:(item:T)=>string|number) {
     seen.add(id);
     return true;
   });
+}
+
+export function retainRepositorySnapshot(next:RepositorySnapshot, previous?:RepositorySnapshot) {
+  if (next.state==='connected') return {...next,lastSuccessfulAt:next.checkedAt};
+  const lastSuccessfulAt=previous?.lastSuccessfulAt ?? (previous?.state==='connected' ? previous.checkedAt : undefined);
+  return previous && lastSuccessfulAt ? {...previous,...next,lastSuccessfulAt} : next;
 }
 
 export async function syncRepository(repository: string, token: string, request = fetch, clock = new Date(), backfill = false): Promise<RepositorySnapshot> {

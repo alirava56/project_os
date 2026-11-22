@@ -489,3 +489,38 @@ test('configured Vault metadata is verified through trusted TLS without exposing
     await new Promise<void>(resolve=>vault.close(()=>resolve()));
   }
 });
+
+test('Gate D displays persisted contract balances, allocated cost and sampled availability', async ({page,origin,postgresFixture})=>{
+  if (!postgresFixture) throw new Error('PostgreSQL is required');
+  expect((await page.request.post('/api/auth/setup',{headers:origin,data:{
+    setupToken,email,password,displayName:'مالک آزمایشی',workspace,
+  }})).status()).toBe(200);
+  const project={id:'gate-d-finance',name:'پروژهٔ مالی',subtitle:'',coverTitle:'مالی',description:'',
+    status:'building',type:'وب‌سایت',progress:0,next:'',art:'navigation/projects'};
+  const other={...project,id:'gate-d-other',name:'پروژهٔ دوم'};
+  const resource={id:'gate-d-server',projectId:project.id,linkedProjectIds:[other.id],name:'سرور مشترک',
+    type:'server',environment:'Development',status:'registered',provider:'Fixture',address:'203.0.113.19',tags:[]};
+  const contract={id:'gate-d-contract',projectId:project.id,title:'قرارداد آزمایش تطبیق',client:'Fixture',
+    start:'2031-01-01',end:'2031-12-31',amount:1234,currency:'USD',amountUnit:'minor',state:'active'};
+  const invoice={id:'gate-d-invoice',projectId:project.id,contractId:contract.id,reference:'D-UI',title:'فاکتور آزمایشی',
+    direction:'receivable',amount:1234,currency:'USD',amountUnit:'minor',issuedOn:'2031-01-01',dueOn:'2031-02-01',state:'open'};
+  const create=(kind:string,record:{id:string})=>({kind,id:record.id,action:'create',record});
+  expect((await page.request.patch('/api/records',{headers:origin,data:{version:0,changes:[
+    create('projects',project),create('projects',other),create('resources',resource),create('contracts',contract),create('invoices',invoice),
+  ]}})).status()).toBe(200);
+  await page.goto('/finance');
+  await expect(page.getByRole('table',{name:'تطبیق قرارداد و فاکتور'}).getByText('منطبق',{exact:true})).toBeVisible();
+  await page.getByRole('button',{name:'تخصیص هزینهٔ مشترک',exact:true}).click();
+  const form=page.getByRole('dialog',{name:'تخصیص هزینهٔ مشترک'});
+  await form.getByLabel('منبع مشترک').selectOption(resource.id);
+  await form.getByLabel('شرح هزینه').fill('سهم هزینهٔ Gate D');
+  await form.getByLabel('مبلغ کل').fill('101');
+  await form.getByRole('button',{name:'ثبت تخصیص'}).click();
+  await expect(page.getByText('سهم هزینهٔ Gate D · سهم هزینهٔ مشترک',{exact:true})).toHaveCount(2);
+  const at=new Date(Math.floor(Date.now()/900_000)*900_000-900_000).toISOString();
+  await postgresFixture.query(`INSERT INTO monitor_observations(workspace_id,resource_id,checked_at,state,status_code,latency_ms,diagnostic,source)
+    SELECT id,$1,$2,'healthy',200,12,'Synthetic HTTPS','https' FROM workspaces`,[resource.id,at]);
+  await page.goto('/monitoring');
+  await expect(page.getByText('پوشش ناکافی برای ارزیابی بودجه',{exact:false})).toBeVisible();
+  await expect(page.locator('html')).toHaveAttribute('dir','rtl');
+});

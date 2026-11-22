@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { createHash } from 'node:crypto';
 import { closeDatabase, lockWorkspace, requireWorkerWorkspace, sql, transaction } from './database.mjs';
-import { probeHttps } from './monitor-probe.mjs';
+import { probeDiagnostic, probeHttps } from './monitor-probe.mjs';
 
 const hosts = new Set((process.env.PROJECTOS_MONITOR_HOSTS ?? '').split(',').map(host => host.trim().toLowerCase()).filter(Boolean));
 const workspace = process.env.PROJECTOS_MONITOR_WORKSPACE;
@@ -19,9 +19,12 @@ async function run() {
   for (let offset = 0; offset < candidates.length; offset += 5) {
     await Promise.all(candidates.slice(offset,offset+5).map(async row => {
       const resource = JSON.parse(row.payload);
-      let observation;
+      let observation, diagnostic='https';
       try { observation = await probeHttps(resource.address, hosts); }
-      catch { observation = {state:'unknown', status:null, latency:null, tlsExpiresAt:null}; }
+      catch (error) {
+        diagnostic=probeDiagnostic(error);
+        observation = {state:'unknown', status:null, latency:null, tlsExpiresAt:null};
+      }
       const at = new Date().toISOString();
       await transaction(async db => {
         const scope = await lockWorkspace(db, workspace);
@@ -30,7 +33,7 @@ async function run() {
         if (!current || JSON.parse(current.payload).address !== resource.address) return;
         await db.run(`INSERT INTO monitor_observations(workspace_id,resource_id,checked_at,state,status_code,latency_ms,diagnostic,source,tls_expires_at)
           VALUES(?,?,?,?,?,?,?,'https',?) ON CONFLICT DO NOTHING`,
-        workspace,row.id,at,observation.state,observation.status,observation.latency,'HTTPS probe',observation.tlsExpiresAt);
+        workspace,row.id,at,observation.state,observation.status,observation.latency,diagnostic,observation.tlsExpiresAt);
         tested++;
         const preferences = await db.one("SELECT payload FROM records WHERE workspace_id=? AND kind='preferences' AND id='singleton'", workspace);
         if (!preferences || !JSON.parse(preferences.payload).outage || observation.state !== 'unhealthy') return;

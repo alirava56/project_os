@@ -24,13 +24,13 @@ const ruleSets={
   contracts:{id:s(100),projectId:s(100),title:s(160),client:s(160),start:s(32),end:s(32),amount:n(1e12),currency:s(10,false,['TOMAN','IRR','USD']),amountUnit:s(10,true,['minor']),state:s(15,false,['draft','active','completed'])},
   revenues:{id:s(100),projectId:s(100),title:s(160),amount:n(1e12),currency:s(10,false,['TOMAN','IRR','USD']),amountUnit:s(10,true,['minor']),date:s(32),status:s(20,false,['received','outstanding'])},
   docs:{id:s(100),title:s(180),projectId:s(100),type:s(30,false,['Runbook','Technical Design','Decision Record','Checklist','Release Notes']),body:s(100000),revision:n(1e6),updated:s(32)},
-  invoices:{id:s(100),projectId:s(100),reference:s(100),title:s(160),direction:s(16,false,['receivable','payable']),
+  invoices:{id:s(100),projectId:s(100),reference:s(100),title:s(160),direction:s(16,false,['receivable','payable']),contractId:s(100,true),
     amount:n(1e12),currency:s(10,false,['TOMAN','IRR','USD']),amountUnit:s(10,false,['minor']),issuedOn:s(10),dueOn:s(10),
     state:s(12,false,['open','void']),installments:{type:'installments',max:24,optional:true}},
   payments:{id:s(100),projectId:s(100),invoiceId:s(100),reference:s(100),amount:n(1e12),
     currency:s(10,false,['TOMAN','IRR','USD']),amountUnit:s(10,false,['minor']),paidOn:s(10)},
   exchangeRates:{id:s(100),projectId:s(100),from:s(10,false,currencies),to:s(10,false,currencies),
-    rate:s(32),source:s(160),observedAt:s(24)},
+    rate:s(32),source:s(160),observedAt:s(24),receivedAt:s(24,true)},
 } as const;
 type Collection=keyof typeof ruleSets;
 type LedgerCollection='invoices'|'payments'|'exchangeRates';
@@ -126,12 +126,21 @@ export function parseRecord<Kind extends Collection>(kind: Kind, item: unknown):
       if (clean.from===clean.to || !rate || !source || !observedAt.includes('T') || Date.parse(observedAt)>Date.now()) {
         bad('Exchange rates require distinct currencies, a positive decimal, a named source and an observed UTC time');
       }
+      if (clean.receivedAt!==undefined) {
+        const receivedAt=clean.receivedAt as string;
+        checkDate(receivedAt);
+        if (!receivedAt.includes('T') || Date.parse(receivedAt)<Date.parse(observedAt) || Date.parse(receivedAt)>Date.now()) {
+          bad('Invalid exchange rate receipt timestamp');
+        }
+        clean.receivedAt=new Date(receivedAt).toISOString();
+      }
       clean.rate=rate.text;
       clean.source=source;
       clean.observedAt=new Date(observedAt).toISOString();
       break;
     }
     case 'invoices': {
+      if (clean.contractId !== undefined && !validRecordId(clean.contractId)) bad('Invalid invoice contract');
       checkDate(clean.issuedOn);
       checkDate(clean.dueOn);
       const issued=clean.issuedOn as string, due=clean.dueOn as string;

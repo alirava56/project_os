@@ -3,7 +3,7 @@
 import { useState, type FormEvent } from 'react';
 import { Download, Plus } from 'lucide-react';
 import { csv, dateLabel, download, newId, today } from '@/lib/format';
-import { installmentBalances, invoiceBalance } from '@/lib/invoice-ledger';
+import { contractReconciliation, installmentBalances, invoiceBalance, invoicePaymentState } from '@/lib/invoice-ledger';
 import { amountLabel, formatMoney, inputAmount, parseAmount } from '@/lib/money';
 import { useDemo } from '@/lib/store';
 import type { CurrencyUnit, Invoice, InvoiceInstallment, Payment } from '@/lib/types';
@@ -12,9 +12,12 @@ import { Button, Empty, Field, FormActions, Modal, Panel, Pill, Table, formValue
 
 const directions={receivable:'دریافتنی',payable:'پرداختنی'};
 const zero=BigInt(0);
+const paymentLabels={void:'باطل',paid:'پرداخت کامل ثبت شده',overdue:'سررسید گذشته',partial:'پرداخت جزئی',unpaid:'پرداخت‌نشده'};
 
 function InvoiceForm({projectId,onClose}:{projectId:string;onClose:()=>void}) {
-  const {change,saving}=useDemo();
+  const {data,change,saving}=useDemo();
+  const [selectedProject,setSelectedProject]=useState(projectId);
+  const [currency,setCurrency]=useState<CurrencyUnit>('TOMAN');
   const [count,setCount]=useState(0);
   const [error,setError]=useState('');
   async function submit(event:FormEvent<HTMLFormElement>) {
@@ -34,7 +37,7 @@ function InvoiceForm({projectId,onClose}:{projectId:string;onClose:()=>void}) {
     }
     const invoice:Invoice={id:newId('invoice'),projectId:get('project'),reference:get('reference'),title:get('title'),
       direction:get('direction') as Invoice['direction'],amount,currency,amountUnit:'minor',
-      issuedOn:get('issuedOn'),dueOn:get('dueOn'),state:'open',installments:installments.length ? installments : undefined};
+      issuedOn:get('issuedOn'),dueOn:get('dueOn'),state:'open',contractId:get('contract')||undefined,installments:installments.length ? installments : undefined};
     setError('');
     if (!await change(data=>({...data,invoices:[...data.invoices,invoice]}),'فاکتور ثبت شد.')) {
       setError('ثبت فاکتور تأیید نشد. شمارهٔ فاکتور، تاریخ‌ها و اقساط را بررسی کنید.');return;
@@ -44,10 +47,13 @@ function InvoiceForm({projectId,onClose}:{projectId:string;onClose:()=>void}) {
   return <Modal title="فاکتور جدید" onClose={onClose}><form className="form-stack" onSubmit={submit}>
     <Field label="عنوان فاکتور"><input name="title" required maxLength={160}/></Field>
     <div className="form-grid">
-      <ProjectField initial={projectId}/>
+      <ProjectField initial={projectId} onChange={setSelectedProject}/>
+      <Field label="قرارداد مرتبط (اختیاری)"><select key={selectedProject+'-'+currency} name="contract"><option value="">بدون قرارداد</option>
+        {data.contracts.filter(item=>item.projectId===selectedProject && item.currency===currency).map(item=><option key={item.id} value={item.id}>{item.title}</option>)}
+      </select></Field>
       <Field label="شمارهٔ فاکتور"><input name="reference" required maxLength={100} dir="auto"/></Field>
       <Field label="نوع فاکتور"><select name="direction"><option value="receivable">دریافتنی</option><option value="payable">پرداختنی</option></select></Field>
-      <Field label="ارز فاکتور"><select name="currency"><option value="TOMAN">تومان</option><option value="IRR">ریال</option><option value="USD">دلار</option></select></Field>
+      <Field label="ارز فاکتور"><select name="currency" value={currency} onChange={event=>setCurrency(event.target.value as CurrencyUnit)}><option value="TOMAN">تومان</option><option value="IRR">ریال</option><option value="USD">دلار</option></select></Field>
       <Field label="مبلغ فاکتور"><input name="amount" inputMode="decimal" required dir="ltr" maxLength={16}/></Field>
       <Field label="تاریخ صدور (میلادی)"><input name="issuedOn" type="date" required dir="ltr" defaultValue={today()}/></Field>
       <Field label="موعد فاکتور (میلادی)"><input name="dueOn" type="date" required dir="ltr" defaultValue={today()}/></Field>
@@ -116,6 +122,7 @@ export function InvoiceLedger({projectId}:{projectId:string}) {
     summaries.set(currency,group);
   }
   const active=invoices.find(invoice=>invoice.id===selected);
+  const contracts=data.contracts.filter(item=>!projectId||item.projectId===projectId);
   function close() {
     setPaying(false);
     setVoiding(false);
@@ -153,8 +160,19 @@ export function InvoiceLedger({projectId}:{projectId:string}) {
         {label:'مبلغ',render:invoice=>amountLabel(invoice)},
         {label:'مانده',render:invoice=>invoice.state==='void'?'—':formatMoney(invoice.remaining,invoice.currency)},
         {label:'موعد',extra:true,render:invoice=>dateLabel(invoice.dueOn)},
-        {label:'وضعیت',extra:true,render:invoice=><Pill>{invoice.state==='void'?'باطل':invoice.remaining===zero?'تسویه‌شده':invoice.paid>zero?'بخشی تسویه‌شده':'باز'}</Pill>},
+        {label:'وضعیت',extra:true,render:invoice=><Pill>{paymentLabels[invoicePaymentState(invoice,invoice.paid,today())]}</Pill>},
       ]}/> : <Empty title="فاکتوری ثبت نشده است"/>}
+    </Panel>
+    <Panel title="تطبیق قرارداد و فاکتور">
+      {contracts.length ? <Table label="تطبیق قرارداد و فاکتور" rows={contracts.map(contract=>({
+        ...contract,...contractReconciliation(contract,invoices,data.payments),
+      }))} columns={[
+        {label:'قرارداد',render:item=>item.title},
+        {label:'جمع فاکتور',render:item=>formatMoney(item.invoiced,item.currency)},
+        {label:'پرداخت ثبت‌شده',render:item=>formatMoney(item.paid,item.currency)},
+        {label:'ماندهٔ فاکتورها',render:item=>formatMoney(item.remaining,item.currency)},
+        {label:'اختلاف با قرارداد',render:item=>item.count===0?'بدون فاکتور':item.difference===zero?'منطبق':formatMoney(item.difference,item.currency)},
+      ]}/> : <Empty title="قراردادی برای تطبیق وجود ندارد"/>}
     </Panel>
     {creating && <InvoiceForm projectId={projectId} onClose={()=>setCreating(false)}/>}
     {active && (paying ? <PaymentForm invoice={active} remaining={active.remaining} onClose={()=>setPaying(false)}/>
@@ -168,7 +186,7 @@ export function InvoiceLedger({projectId}:{projectId:string}) {
         <p className="muted">{active.reference} · {directions[active.direction]} · {active.state==='void'
           ? 'باطل' : 'مانده ' + formatMoney(active.remaining,active.currency)}</p>
         {active.state==='open' && <ul>{installmentBalances(active,active.paid).map(item=><li key={item.dueOn}>
-          {dateLabel(item.dueOn)} · ماندهٔ قسط {formatMoney(item.remaining,active.currency)}
+          {dateLabel(item.dueOn)} · {item.remaining===zero?'پرداخت‌شده':item.dueOn<today()?'سررسید گذشته':'در انتظار پرداخت'} · ماندهٔ قسط {formatMoney(item.remaining,active.currency)}
         </li>)}</ul>}
         {(grouped.get(active.id) ?? []).map(payment=><p key={payment.id}><bdi>{payment.reference}</bdi> · {amountLabel(payment)} · {dateLabel(payment.paidOn)}</p>)}
         {owner && active.state==='open' && active.remaining>zero && <Button icon={Plus} onClick={()=>setPaying(true)}>ثبت پرداخت</Button>}

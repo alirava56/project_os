@@ -917,3 +917,97 @@ test('notification claim cannot send after cancellation and an interrupted dispa
     process.env.PROJECTOS_DB_PATH=original;
   }
 });
+
+test('contract reconciliation keeps exact minor units and detects unpaid overdue installments',()=>{
+  const {contractReconciliation,invoicePaymentState}=require('../src/lib/invoice-ledger.ts');
+  const contract={id:'lease',projectId:'a',currency:'USD',amount:1234,amountUnit:'minor'};
+  const invoice={id:'inv',projectId:'a',contractId:'lease',currency:'USD',amount:1234,state:'open',
+    installments:[{dueOn:'2031-01-01',amount:234},{dueOn:'2031-02-01',amount:1000}]};
+  const payment={projectId:'a',invoiceId:'inv',currency:'USD',amount:200};
+  assert.deepEqual(contractReconciliation(contract,[invoice,{...invoice,projectId:'b'}],
+    [payment,{...payment,currency:'IRR'},{...payment,projectId:'b'}]),
+  {count:1,invoiced:1234n,paid:200n,remaining:1034n,difference:0n});
+  assert.equal(invoicePaymentState(invoice,200n,'2031-01-02'),'overdue');
+  assert.equal(invoicePaymentState(invoice,234n,'2031-01-02'),'partial');
+  assert.equal(invoicePaymentState(invoice,1234n,'2031-02-02'),'paid');
+});
+
+test('sampled SLO does not count absent or unknown slots as healthy and counts duplicate failures once',()=>{
+  const {sampledAvailability}=require('../src/lib/slo.ts');
+  const row=(time,state,source='https')=>({resourceId:'r',checkedAt:'2031-01-04T'+time+'Z',state,source});
+  const reports=sampledAvailability([row('10:02:00','healthy'),row('10:14:00','unhealthy'),row('10:16:00','healthy'),
+    row('10:22:00','healthy'),row('10:38:00','unknown'),row('10:57:00','healthy','machine-agent'),row('11:02:00','healthy')],
+  Date.parse('2031-01-04T11:04:00Z'));
+  assert.deepEqual(reports,[{resourceId:'r',covered:2,expected:96,failed:1,availability:50,
+    errorBudgetRemaining:2*(1-99.9/100)-1}]);
+});
+
+test('GitHub refresh errors preserve last successful contents while advancing failure status',()=>{
+  const {retainRepositorySnapshot}=require('../src/lib/server/github.ts');
+  const previous={repository:'fixture/repo',state:'connected',checkedAt:'2031-01-04T10:00:00Z',commits:[{sha:'a'.repeat(40)}]};
+  const next={repository:previous.repository,state:'rate_limited',checkedAt:'2031-01-04T10:10:00Z',retryAt:'2031-01-04T11:00:00Z'};
+  const snapshot=retainRepositorySnapshot(next,previous);
+  assert.equal(snapshot.state,'rate_limited');
+  assert.equal(snapshot.lastSuccessfulAt,previous.checkedAt);
+  assert.deepEqual(snapshot.commits,previous.commits);
+  assert.equal(retainRepositorySnapshot({...next,state:'unknown'},snapshot).lastSuccessfulAt,previous.checkedAt);
+});
+
+test('currencyapi adapter bounds payloads, preserves decimals, validates attribution and handles outages',async()=>{
+  const {getUsdIrr}=require('../src/lib/server/currency-provider.ts');
+  const now=Date.parse('2031-01-04T11:00:00Z');
+  const mock=async (url,options)=>{
+    assert.equal(url,'https://api.currencyapi.com/v3/latest?base_currency=USD&currencies=IRR');
+    assert.equal(options.redirect,'error');
+    assert.equal(options.headers.apikey,'synthetic-fixture');
+    return new Response('{"meta":{"last_updated_at":"2031-01-04T10:00:00Z"},"data":{"IRR":{"code":"IRR","value":123456789012.123456789}}}');
+  };
+  assert.deepEqual(await getUsdIrr('synthetic-fixture',mock,now),{status:'ok',rate:'123456789012.123456789',
+    observedAt:'2031-01-04T10:00:00.000Z',receivedAt:'2031-01-04T11:00:00.000Z'});
+  assert.equal((await getUsdIrr('synthetic-fixture',mock,now+3*86_400_000)).status,'unavailable');
+  assert.deepEqual(await getUsdIrr('synthetic-fixture',async()=>new Response(null,{status:429,headers:{'Retry-After':'60'}}),now),
+    {status:'rate_limited',retryAfter:60});
+  assert.equal((await getUsdIrr('synthetic-fixture',async()=>{throw new Error('timeout');},now)).status,'unavailable');
+  for (const entry of [{code:'USD',value:10},{code:'IRR',value:0},{code:'IRR',value:-4}]) {
+    assert.equal((await getUsdIrr('synthetic-fixture',async()=>Response.json({
+      meta:{last_updated_at:'2031-01-04T10:00:00Z'},data:{IRR:entry},
+    }),now)).status,'unavailable');
+  }
+});
+
+test('equal cost allocation conserves each minor unit and has deterministic remainders',()=>{
+  const {splitSharedCost}=require('../src/lib/shared-cost.ts');
+  assert.deepEqual(splitSharedCost(101n,['c','a','b','a']),[
+    {projectId:'a',amount:34n},{projectId:'b',amount:34n},{projectId:'c',amount:33n},
+  ]);
+  assert.deepEqual(splitSharedCost(1n,['a','b']),[]);
+  assert.deepEqual(splitSharedCost(11n,['a']),[]);
+});
+
+test('currency adapter reads the documented quote through a loopback HTTP simulator',async t=>{
+  const {getUsdIrr}=require('../src/lib/server/currency-provider.ts');
+  const {localProvider,reply}=await import('./test-provider-http.mjs');
+  const calls=[];
+  const mock=await localProvider((request,response)=>{
+    calls.push(request.method+' '+request.url);
+    reply(response,200,{meta:{last_updated_at:'2031-01-04T10:00:00Z'},data:{IRR:{code:'IRR',value:1234.56789}}});
+  });
+  t.after(()=>mock.close());
+  const proxy=(url,options)=>{
+    const upstream=new URL(url);
+    assert.equal(upstream.origin,'https://api.currencyapi.com');
+    return fetch(mock.origin+upstream.pathname+upstream.search,options);
+  };
+  const quote=await getUsdIrr('synthetic-fixture',proxy,Date.parse('2031-01-04T11:00:00Z'));
+  assert.equal(quote.status,'ok');
+  assert.equal(quote.rate,'1234.56789');
+  assert.deepEqual(calls,['GET /v3/latest?base_currency=USD&currencies=IRR']);
+});
+
+test('HTTPS monitoring returns bounded diagnostic classes without exposing transport messages',async()=>{
+  const {probeDiagnostic}=await import('./monitor-probe.mjs');
+  for (const [code,expected] of [['ENOTFOUND','dns'],['CERT_HAS_EXPIRED','tls'],['ABORT_ERR','timeout'],
+    ['ECONNREFUSED','connection'],['synthetic-unclassified','unavailable']]) {
+    assert.equal(probeDiagnostic({code,message:'synthetic private detail'}),expected);
+  }
+});

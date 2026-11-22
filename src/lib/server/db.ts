@@ -4,6 +4,7 @@ import { getDb, lockWorkspace, readTransaction, sql, transaction, type SqlExecut
 import { reminderAlertId, retireReminderAlert } from '../../../scripts/reminder-scheduler.mjs';
 import { emptyData } from '../empty-data';
 import { normalized } from '../format';
+import { allocationId } from '../shared-cost';
 import { isRecordKind, recordKinds, type RecordKind, type WorkspaceRecord } from '../record-contract';
 import type { ActivityEvent, DemoData, Invoice, Payment, Preferences, Resource } from '../types';
 import { redactStoredValue, redactCredentials } from './credential-guard';
@@ -305,8 +306,9 @@ async function retireChangedDeadlines(db: SqlExecutor, workspace: string, change
 
 async function validateInvoiceLedger(db: SqlExecutor, workspace: string) {
   const rows=await db.all<Pick<RecordRow,'kind'|'id'|'payload'>>(
-    `SELECT kind,id,payload FROM ${recordReadTable(db)} WHERE workspace_id=? AND kind IN ('projects','invoices','payments')`,workspace);
+    `SELECT kind,id,payload FROM ${recordReadTable(db)} WHERE workspace_id=? AND kind IN ('projects','contracts','invoices','payments')`,workspace);
   const projects=new Set(rows.filter(row=>row.kind==='projects').map(row=>row.id));
+  const contracts=new Map(rows.filter(row=>row.kind==='contracts').map(row=>[row.id,JSON.parse(row.payload) as DemoData['contracts'][number]]));
   const invoices=new Map<string,Invoice>();
   const invoiceReferences=new Set<string>();
   for (const row of rows) {
@@ -314,6 +316,12 @@ async function validateInvoiceLedger(db: SqlExecutor, workspace: string) {
     const invoice=JSON.parse(row.payload) as Invoice;
     const key=normalized(invoice.reference.normalize('NFKC'));
     if (!projects.has(invoice.projectId)) throw new ValidationError('Invoice project must exist');
+    if (invoice.contractId !== undefined) {
+      const contract=contracts.get(invoice.contractId);
+      if (!contract || contract.projectId!==invoice.projectId || contract.currency!==invoice.currency) {
+        throw new ValidationError('Invoice contract must have the same project and currency');
+      }
+    }
     if (invoiceReferences.has(key)) throw new ValidationError('Duplicate invoice reference');
     invoiceReferences.add(key);
     invoices.set(invoice.id,invoice);
@@ -339,6 +347,7 @@ async function validateInvoiceLedger(db: SqlExecutor, workspace: string) {
 
 export async function persistChanges(
   db: SqlExecutor, account: Account, version: number, changes: PreparedChange[], preferences?: Preferences,
+  provenance?:'shared-cost' | 'currency-provider',
 ) {
   const now = new Date().toISOString();
   const { workspaceId } = account;
@@ -349,7 +358,12 @@ export async function persistChanges(
     const { kind, id, record, previous } = change;
     const before = previous ? JSON.parse(previous.payload) as WorkspaceRecord : undefined;
     const projectId = record ? projectOf(kind, record) : previous?.project_id ?? null;
+    if (kind==='expenses' && allocationId.test(id) && (!record || (before ? !isDeepStrictEqual({...before,status:(record as DemoData['expenses'][number]).status},record) : provenance!=='shared-cost'))) {
+      throw new ValidationError('Shared expense shares preserve the original allocation');
+    }
     if (kind==='payments' && previous) throw new ValidationError('Posted payments are immutable');
+    if (kind==='exchangeRates' && (record as DemoData['exchangeRates'][number] | undefined)?.receivedAt && !previous
+      && provenance!=='currency-provider') throw new ValidationError('Provider receipt time is server managed');
     if (kind==='exchangeRates' && previous) throw new ValidationError('Recorded exchange rates are immutable');
     if (kind==='projects' && !record && await db.one(`SELECT id FROM ${recordReadTable(db)} WHERE workspace_id=?
       AND project_id=? AND kind='exchangeRates' LIMIT 1`,workspaceId,id)) {
@@ -441,7 +455,7 @@ export async function persistChanges(
     record ? previous ? 'update' : 'create' : 'delete', redactCredentials(title), projectId ?? '', now,
     redactCredentials(account.displayName));
   }
-  if (changes.some(({kind, record})=>kind==='invoices' || kind==='payments' || (kind==='projects' && !record))) {
+  if (changes.some(({kind, record})=>kind==='invoices' || kind==='payments' || kind==='contracts' || (kind==='projects' && !record))) {
     await validateInvoiceLedger(db,workspaceId);
   }
   if (preferences) {

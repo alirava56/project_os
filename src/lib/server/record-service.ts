@@ -96,7 +96,7 @@ async function validateRelations(db: SqlExecutor, workspaceId: string, changes: 
 }
 
 export async function commitRecordChanges(
-  account: Account, expectedVersion: number, input: unknown, preferences?: unknown, strictWorkspaceVersion = false,
+  account: Account, expectedVersion: number, input: unknown, preferences?: unknown, strictWorkspaceVersion = false, provenance?:'shared-cost' | 'currency-provider',
 ) {
   if (!Number.isSafeInteger(expectedVersion) || expectedVersion < 0) throw new ValidationError('Invalid revision');
   if (!Array.isArray(input) || input.length > 100 || (!input.length && preferences === undefined)) {
@@ -163,7 +163,7 @@ export async function commitRecordChanges(
     }
     await validateRelations(db, account.workspaceId, prepared, !privateTaskGraph);
     const version = workspace.version + 1;
-    await persistChanges(db, account, version, [...prepared.values()], settings);
+    await persistChanges(db, account, version, [...prepared.values()], settings, provenance);
     const tasks=[...prepared.values()].filter(change=>change.kind==='tasks').map(change=>change.id);
     if (privateTaskGraph && tasks.length) {
       const verified=await db.one<{result:string}>('SELECT public.projectos_check_task_graph(?::jsonb) AS result',JSON.stringify(tasks));
