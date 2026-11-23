@@ -100,7 +100,7 @@ test('create, edit, navigate, archive and restore a project', async ({ page }) =
   await expect(page.getByText('در حال توسعه',{exact:true})).toBeVisible();
 });
 
-test('task creation, status mutation, list filters, checklist and comments', async ({ page }) => {
+test('task creation, status mutation, list filters, checklist and comments', async ({ page, origin }) => {
   await page.goto('/tasks');
   await page.getByRole('button',{name:'وظیفه جدید',exact:true}).click();
   const dialog = page.getByRole('dialog');
@@ -110,10 +110,44 @@ test('task creation, status mutation, list filters, checklist and comments', asy
   await dialog.getByLabel('موعد (میلادی)').fill('2025-11-17');
   await dialog.getByRole('button',{name:'ایجاد وظیفه'}).click();
   await expect(page).toHaveURL(/\/tasks\/task-/);
-  await page.getByLabel('تغییر وضعیت وظیفه').selectOption('done');
-  await page.getByLabel('یادداشت جدید').fill('یادداشت آزمون');
-  await page.getByRole('button',{name:'ثبت یادداشت'}).click();
+  let releaseStatus!: () => void;
+  let statusCommitted!: () => void;
+  const held = new Promise<void>(resolve=>{releaseStatus=resolve;});
+  const committed = new Promise<void>(resolve=>{statusCommitted=resolve;});
+  await page.route('**/api/records',async route=>{
+    const response=await route.fetch();
+    statusCommitted();
+    await held;
+    await route.fulfill({response});
+  },{times:1});
+  const note=page.getByLabel('یادداشت جدید');
+  const submitNote=page.getByRole('button',{name:'ثبت یادداشت'});
+  try {
+    await page.getByLabel('تغییر وضعیت وظیفه').selectOption('done');
+    await committed;
+    await note.fill('یادداشت آزمون');
+    await submitNote.click();
+    await expect(note).toHaveValue('یادداشت آزمون');
+  } finally { releaseStatus(); }
   await expect(page.getByText('یادداشت آزمون',{exact:true})).toBeVisible();
+  await expect(note).toHaveValue('');
+  const endpoint='/api/records'+new URL(page.url()).pathname;
+  const current=await (await page.request.get(endpoint)).json();
+  expect(current.record.status).toBe('done');
+  expect(current.record.comments[0].text).toBe('یادداشت آزمون');
+
+  const concurrent=await page.request.put(endpoint,{headers:origin,data:{
+    version:current.version,record:{...current.record,description:'تغییر مستقل وظیفه'},
+  }});
+  expect(concurrent.status()).toBe(200);
+  await note.fill('یادداشت پس از تعارض');
+  await submitNote.click();
+  await expect(page.getByText(/رکورد تغییر کرده است/)).toBeVisible();
+  await expect(note).toHaveValue('یادداشت پس از تعارض');
+  await submitNote.click();
+  await expect(page.getByText('یادداشت پس از تعارض',{exact:true})).toBeVisible();
+  const saved=await (await page.request.get(endpoint)).json();
+  expect(saved.record.description).toBe('تغییر مستقل وظیفه');
   await page.getByRole('button',{name:'ویرایش وظیفه'}).click();
   await dialog.getByLabel('عنوان وظیفه').fill('وظیفه بازبینی مرورگر');
   await dialog.getByRole('button',{name:'ذخیره تغییرات'}).click();

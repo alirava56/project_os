@@ -1,4 +1,4 @@
-import { canSeeProject, projectPolicy, readTransaction, storedRecord, type Account } from './db';
+import { canSeeProject, projectPolicy, readTransaction, recordReadTable, storedRecord, type Account } from './db';
 import { MissingRecordError } from './record-service';
 import { redactCredentials, redactStoredValue, suspiciousCredential } from './credential-guard';
 import type { Project, Task } from '../types';
@@ -31,7 +31,7 @@ export async function resumeProject(account: Account, projectId: string) {
   return readTransaction(async db => {
     const policy=await projectPolicy(db,account);
     const stored=canSeeProject(policy,projectId) && await db.one<Pick<MemoryRow,'updated_at'|'payload'>>(
-      "SELECT updated_at,payload FROM records WHERE workspace_id=? AND kind='projects' AND id=?",account.workspaceId,projectId);
+      `SELECT updated_at,payload FROM ${recordReadTable(db)} WHERE workspace_id=? AND kind='projects' AND id=?`,account.workspaceId,projectId);
     if (!stored) throw new MissingRecordError();
     const project=redactStoredValue(JSON.parse(stored.payload)) as Project;
     const workspace=account.workspaceId;
@@ -66,7 +66,7 @@ export async function resumeProject(account: Account, projectId: string) {
           href:paths.projects.href(projectId),updatedAt:stored.updated_at,excerpt:next});
         notes.push('قدم بعدی ثبت‌شده «'+next+'» ['+citations.length+']');
       } else {
-        const rows=await db.all<MemoryRow>(`SELECT kind,id,project_id,updated_at,payload FROM records
+        const rows=await db.all<MemoryRow>(`SELECT kind,id,project_id,updated_at,payload FROM ${recordReadTable(db)}
           WHERE workspace_id=? AND project_id=? AND kind='tasks' ORDER BY updated_at DESC,id LIMIT 2000`,workspace,projectId);
         const priorities={high:0,medium:1,low:2};
         const candidate=rows.map(row=>({row,task:redactStoredValue(JSON.parse(row.payload)) as Task}))
@@ -98,7 +98,7 @@ export async function retrieveMemory(account: Account, query: string, projectId?
     const scope = projectId ? [projectId] : policy.projectIds ? [...policy.projectIds] : undefined;
     if (scope && !scope.length) return [];
     const clauses = scope ? ' AND project_id IN (' + scope.map(() => '?').join(',') + ')' : '';
-    const rows = await db.all<MemoryRow>(`SELECT kind,id,project_id,updated_at,payload FROM records WHERE workspace_id=?
+    const rows = await db.all<MemoryRow>(`SELECT kind,id,project_id,updated_at,payload FROM ${recordReadTable(db)} WHERE workspace_id=?
       AND kind IN ('docs','tasks','projects','reminders')${clauses} ORDER BY updated_at DESC,id LIMIT 2000`,
     account.workspaceId, ...(scope ?? []));
     const terms = [...new Set(normalizePersian(query).split(/[^\p{L}\p{N}]+/u).filter(term => term.length > 1))];

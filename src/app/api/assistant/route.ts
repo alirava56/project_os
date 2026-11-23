@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { validRecordId } from '@/lib/record-contract';
 import { checkOrigin, getCurrentAccount, readLimitedJson } from '@/lib/server/auth';
-import { ForbiddenError, sql } from '@/lib/server/db';
+import { ForbiddenError, projectPolicy, transaction } from '@/lib/server/db';
 import { apiError, jsonError, noStore } from '@/lib/server/http';
 import { suspiciousCredential } from '@/lib/server/credential-guard';
 import { resumeProject, retrieveMemory, verifyQuotes, type Citation } from '@/lib/server/project-memory';
@@ -62,9 +62,12 @@ export async function POST(request: NextRequest) {
   const safe = citations.filter(citation => citation.excerpt && !suspiciousCredential(citation.title + '\n' + citation.excerpt));
   if (!safe.length) return retrieval('منبع قابل ارسال برای تولید پاسخ پیدا نشد.', citations);
   const hour = new Date().toISOString().slice(0, 13);
-  const claim = await sql.one(`INSERT INTO ai_quota(user_id,hourly_window,used) VALUES(?,?,1)
+  const claim = await transaction(async db => {
+    await projectPolicy(db,account);
+    return db.one(`INSERT INTO ai_quota(user_id,hourly_window,used) VALUES(?,?,1)
     ON CONFLICT(user_id,hourly_window) DO UPDATE SET used=ai_quota.used+1
     WHERE ai_quota.used<20 RETURNING used`, account.id, hour);
+  });
   if (!claim) return apiError('AI hourly budget exhausted', 429);
   try {
     const response = await fetch('https://api.openai.com/v1/responses', {

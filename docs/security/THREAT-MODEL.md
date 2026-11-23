@@ -71,6 +71,12 @@ P2: AI RAG citation quality, project intelligence, full visual and accessibility
 
 No production approval is implied by tests or static typechecking.
 
+## Gate C integration boundaries
+
+Vault requests use a server-configured HTTPS origin, approved KV v2 mounts and metadata paths. Redirects are rejected and normal TLS certificate verification remains enabled. Version numbers and status are the only provider-derived fields returned to the application. The Vault token requires a metadata-only policy, further constrained to the operator-approved prefix.
+
+Notification workers authenticate as separate PostgreSQL logins. The browser reads delivery status and retry times only for alerts visible under the current project grants. It cannot read queue leases, recipient addresses or provider identifiers. Telegram project and alert labels require explicit operator opt-in for the destination group. Email content stays generic. Unknown outcomes stop automated delivery after an ambiguous request, while explicit transient failures can retry within the configured schedule. The database cannot recall a request already in flight.
+
 ## Revision 2026-11-18 — Security hardening review
 
 This revision supersedes earlier statements claiming there is no MFA or no optional outgoing connection. TOTP and single-use recovery codes exist; Telegram, GitHub, monitoring and LLM outgoing requests are opt-in and require server-side configuration. MFA-protected existing accounts must supply a valid second factor when joining via a new invitation. Absolute session lifetime is seven days with an additional 24-hour inactivity timeout. Client input is stream-bounded at the API and manual activity uses a transactional per-user rate limit. Auto-generated alerts have worker-owned immutable identity/provenance. Database paths inside static directories or through symlinks are rejected.

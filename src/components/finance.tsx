@@ -5,6 +5,7 @@ import { useState, type FormEvent } from 'react';
 import { CalendarDays, ChartNoAxesCombined, CircleAlert, CircleCheck, CreditCard, Download, FileText, FolderKanban, Layers, Plus, ReceiptText, Server, Wallet } from 'lucide-react';
 import { csv, dateLabel, download, matches, newId, percent, resourceHref, today } from '@/lib/format';
 import { useDemo } from '@/lib/store';
+import { allocationId } from '@/lib/shared-cost';
 import type { Expense, RecurringCharge, ContractRecord, RevenueEntry, CurrencyUnit } from '@/lib/types';
 import { Bars, Donut, Trend } from './charts';
 import { ExchangeRates } from './exchange-rates';
@@ -45,8 +46,44 @@ function ExpenseForm({ onClose, initial, projectId }: { onClose: () => void; ini
   </form></Modal>;
 }
 
+function SharedCostForm({onClose}:{onClose:()=>void}) {
+  const {data}=useDemo();
+  const [reference]=useState(()=>crypto.randomUUID());
+  const [saving,setSaving]=useState(false);
+  const [error,setError]=useState('');
+  const resources=data.resources.filter(resource=>resource.linkedProjectIds?.some(id=>id!==resource.projectId));
+  async function submit(event:FormEvent<HTMLFormElement>) {
+    const get=formValues(event);
+    const currency=get('currency') as CurrencyUnit;
+    const amount=parseAmount(get('amount'),currency);
+    if (!amount) {setError('مبلغ باید مثبت و متناسب با ارز باشد.');return;}
+    setSaving(true);setError('');
+    try {
+      const response=await fetch('/api/shared-costs',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+        reference,resourceId:get('resource'),title:get('title'),amount,currency,date:get('date'),
+      })});
+      if (response.ok) {window.location.reload();return;}
+      setError(response.status===409?'ثبت قبلی یا تغییر هم‌زمان پیدا شد. صفحه را تازه کنید.':'ثبت سهم هزینه تأیید نشد.');
+    } catch {setError('ثبت سهم هزینه تأیید نشد.');}
+    finally {setSaving(false);}
+  }
+  return <Modal title="تخصیص هزینهٔ مشترک" onClose={onClose}><form className="form-stack" onSubmit={submit}>
+    <Field label="منبع مشترک"><select required name="resource"><option value="">انتخاب منبع</option>
+      {resources.map(resource=><option key={resource.id} value={resource.id}>{resource.name}</option>)}
+    </select></Field>
+    <Field label="شرح هزینه"><input name="title" maxLength={160} required/></Field>
+    <Field label="واحد ارز"><select name="currency"><SelectOptions options={['TOMAN','IRR','USD']}/></select></Field>
+    <Field label="مبلغ کل"><input name="amount" inputMode="decimal" required dir="ltr"/></Field>
+    <Field label="تاریخ (میلادی)"><input name="date" type="date" required defaultValue={today()} dir="ltr"/></Field>
+    <p className="muted">مبلغ یک‌بار ثبت و به‌طور مساوی بین پروژه‌های مرتبط تقسیم می‌شود.</p>
+    {error && <p className="form-error" role="alert">{error}</p>}
+    <FormActions onClose={onClose} saving={saving} submit="ثبت تخصیص"/>
+  </form></Modal>;
+}
+
 export function Finance() {
   const { data, projectScope, setProjectScope } = useDemo();
+  const canWrite = data.users[0]?.role === 'Owner';
   const [category,setCategory] = useState('');
   const [status,setStatus] = useState('');
   const [query,setQuery] = useState('');
@@ -54,6 +91,7 @@ export function Finance() {
   const [from,setFrom] = useState('');
   const [to,setTo] = useState('');
   const [show,setShow] = useState(false);
+  const [allocating,setAllocating]=useState(false);
   const [edit,setEdit] = useState<Expense>();
   const [newFinance,setNewFinance]=useState<'charge'|'contract'|'revenue'|null>(null);
   const invalidRange = !!(from && to && from > to);
@@ -71,7 +109,8 @@ export function Finance() {
 
   return <>
     <Heading title="هزینه‌ها و قراردادها" subtitle="ثبت هزینه‌های  زیرساخت، اشتراک‌ها و تمدید هر پروژه">
-      <Button variant="primary" icon={Plus} onClick={() => setShow(true)}>هزینه جدید</Button>
+      {canWrite && <Button variant="primary" icon={Plus} onClick={() => setShow(true)}>هزینه جدید</Button>}
+      {canWrite && data.resources.some(resource=>resource.linkedProjectIds?.length) && <Button onClick={()=>setAllocating(true)}>تخصیص هزینهٔ مشترک</Button>}
     </Heading>
     <Metrics entries={[
       {label:'مجموع هزینه‌های',value:summaryByCurrency(items),note:'براساس فیلترهای جاری',icon:Wallet},
@@ -97,7 +136,7 @@ export function Finance() {
         <Panel title="توزیع هزینه‌های">{split.length ? <Donut entries={split} display={summaryByCurrency(chartItems)} /> : <Empty title="هزینه‌ای پیدا نشد" />}</Panel>
       </div>
       <Panel title="اشتراک‌های دوره‌ای و موعد تمدید">
-        <div className="flex justify-end"><Button onClick={()=>setNewFinance('charge')} icon={Plus}>ثبت اشتراک دوره‌ای</Button></div>
+        {canWrite && <div className="flex justify-end"><Button onClick={()=>setNewFinance('charge')} icon={Plus}>ثبت اشتراک دوره‌ای</Button></div>}
         {data.charges.length?<Table label="اشتراک‌های واقعی ثبت‌شده" rows={data.charges.filter(c=>!projectScope||c.projectId===projectScope)} columns={[
           {label:'اشتراک',render:c=>c.title},{label:'دوره',render:c=>c.period},{label:'مبلغ',render:c=>amountLabel(c)},
           {label:'منبع',render:c=>{
@@ -108,14 +147,14 @@ export function Finance() {
         ]}/>:<Empty title="اشتراک دوره‌ای ثبت نشده است" />}
       </Panel>
       <Panel title="قراردادهای پروژه">
-        <div className="flex justify-end"><Button onClick={()=>setNewFinance('contract')} icon={Plus}>ثبت قرارداد</Button></div>
+        {canWrite && <div className="flex justify-end"><Button onClick={()=>setNewFinance('contract')} icon={Plus}>ثبت قرارداد</Button></div>}
         {data.contracts.length?<Table label="قراردادها" rows={data.contracts.filter(c=>!projectScope||c.projectId===projectScope)} columns={[
           {label:'قرارداد',render:c=>c.title},{label:'مشتری',render:c=>c.client},{label:'مبلغ',render:c=>amountLabel(c)},
           {label:'پایان',render:c=>dateLabel(c.end)},{label:'وضعیت',render:c=>c.state}
         ]}/>:<Empty title="قراردادی ثبت نشده است" />}
       </Panel>
       <Panel title="درآمدهای ثبت‌شده">
-        <div className="flex justify-end"><Button onClick={()=>setNewFinance('revenue')} icon={Plus}>ثبت درآمد</Button></div>
+        {canWrite && <div className="flex justify-end"><Button onClick={()=>setNewFinance('revenue')} icon={Plus}>ثبت درآمد</Button></div>}
         {data.revenues.length?<Table label="درآمدهای واقعی ثبت‌شده" rows={data.revenues.filter(c=>!projectScope||c.projectId===projectScope)} columns={[
           {label:'شرح',render:c=>c.title},{label:'مبلغ',render:c=>amountLabel(c)},
           {label:'تاریخ',render:c=>dateLabel(c.date)},{label:'وضعیت',render:c=>c.status==='received'?'دریافت‌شده':'در انتظار'}
@@ -124,15 +163,17 @@ export function Finance() {
       <InvoiceLedger projectId={projectScope}/>
       <ExchangeRates projectId={projectScope}/>
       <Panel title="فهرست پرداخت‌ها و تمدیدها"><Table label="پرداخت‌های" rows={items} columns={[
-        {label:'شرح',render:e => <button className="cell-link" type="button" onClick={() => setEdit(e)}>{e.title}</button>},
+        {label:'شرح',render:e => allocationId.test(e.id) ? e.title+' · سهم هزینهٔ مشترک' : canWrite
+          ? <button className="cell-link" type="button" onClick={() => setEdit(e)}>{e.title}</button> : e.title},
         {label:'پروژه',render:e => <bdi>{projectName(data,e.projectId)}</bdi>},
         {label:'نوع',render:e => e.category}, {label:'مبلغ',render:e => amountLabel(e)}, {label:'تاریخ',render:e => dateLabel(e.date)},
         {label:'وضعیت',render:e => <Pill tone={e.status === 'paid' ? 'good' : 'warn'}>{e.status === 'paid' ? 'پرداخت‌شده' : 'پیش رو'}</Pill>},
       ]} /></Panel>
     </div>}
-    {show && <ExpenseForm projectId={projectScope} onClose={() => setShow(false)} />}
-    {edit && <ExpenseForm projectId={projectScope} initial={edit} onClose={() => setEdit(undefined)} />}
-    {newFinance && <AdditionalFinanceForm kind={newFinance} projectId={projectScope} onClose={()=>setNewFinance(null)} />}
+    {canWrite && allocating && <SharedCostForm onClose={()=>setAllocating(false)}/>}
+    {canWrite && show && <ExpenseForm projectId={projectScope} onClose={() => setShow(false)} />}
+    {canWrite && edit && <ExpenseForm projectId={projectScope} initial={edit} onClose={() => setEdit(undefined)} />}
+    {canWrite && newFinance && <AdditionalFinanceForm kind={newFinance} projectId={projectScope} onClose={()=>setNewFinance(null)} />}
   </>;
 }
 
@@ -186,7 +227,7 @@ function AdditionalFinanceForm({kind,projectId,onClose}:{kind:'charge'|'contract
       <Field label="پایان (میلادی)"><input name="end" type="date" defaultValue={today()} dir="ltr" required /></Field></>}
     {kind==='revenue'&&<><Field label="تاریخ (میلادی)"><input name="date" type="date" defaultValue={today()} dir="ltr" required /></Field>
       <Field label="وضعیت"><select name="status"><option value="received">دریافت‌شده</option><option value="outstanding">در انتظار</option></select></Field></>}
-    <Callout>اطلاعات مالی فقط به‌صورت دستی ثبت می‌شود. نرخ تبدیل ارز، فاکتور رسمی و تأیید بانکی هنوز متصل نیستند.</Callout>
+    <Callout>اطلاعات مالی و نرخ تبدیل به‌صورت دستی ثبت می‌شوند. تأیید بانکی و صدور فاکتور رسمی به سرویس بیرونی نیاز دارند.</Callout>
     {error && <p className="form-error" role="alert">{error}</p>}
     <FormActions onClose={onClose} saving={saving} submit={`ثبت ${title}`} />
   </form></Modal>;

@@ -1,12 +1,17 @@
 import pg from 'pg';
-import { openSqlite } from './sqlite.mjs';
+import { createHmac } from 'node:crypto';
+import { assertSqliteWritable, openSqlite } from './sqlite.mjs';
 
 let sqlite;
 let pool;
 let queue = Promise.resolve();
 
 export function postgresConfigured() {
-  return Boolean(process.env.PROJECTOS_DATABASE_URL);
+  const configured = Boolean(process.env.PROJECTOS_DATABASE_URL);
+  if (!configured && process.env.PROJECTOS_DATABASE_MODE === 'postgres') {
+    throw new Error('PostgreSQL cutover requires PROJECTOS_DATABASE_URL');
+  }
+  return configured;
 }
 
 function localHost(hostname) {
@@ -56,6 +61,7 @@ export function getDb() {
       throw new Error('PostgreSQL is required outside localhost');
     }
   }
+  assertSqliteWritable();
   sqlite ??= openSqlite();
   return sqlite;
 }
@@ -122,6 +128,7 @@ async function inTransaction(action, readOnly) {
       db.exec(readOnly ? 'BEGIN' : 'BEGIN IMMEDIATE');
       try {
         const value = await action(sqliteExecutor(db));
+        if (!readOnly) assertSqliteWritable();
         db.exec('COMMIT');
         return value;
       } catch (error) {
@@ -132,15 +139,54 @@ async function inTransaction(action, readOnly) {
   }
   const client = await getPostgresPool().connect();
   let discard = false;
+  function onConnectionError() { discard = true; }
+  client.on('error', onConnectionError);
   try {
     await client.query(readOnly ? 'BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY' : 'BEGIN');
-    const value = await action(postgresExecutor(client));
+    const db = postgresExecutor(client);
+    let workspace;
+    let binding;
+    const sign = async (context) => {
+      const key = process.env.PROJECTOS_DB_SCOPE_KEY;
+      if (!key) return;
+      if (!/^[a-f0-9]{64}$/i.test(key)) throw new Error('Invalid database scope signing key');
+      binding ??= (await client.query(
+        "SELECT pg_backend_pid()::text || ':' || extract(epoch FROM transaction_timestamp())::text AS binding"
+      )).rows[0].binding;
+      return createHmac('sha256',Buffer.from(key,'hex')).update(binding + ':' + context).digest('hex');
+    };
+    if (process.env.PROJECTOS_DB_SCOPE_KEY) db.scopeIdentity = async (scope) => {
+      const claims = JSON.stringify(scope);
+      const mac = await sign('identity:' + claims);
+      if (mac) await client.query(
+        "SELECT set_config('projectos.identity_scope', $1, true), set_config('projectos.identity_mac', $2, true)",
+        [claims, mac],
+      );
+    };
+    db.scopeWorkspace = async (workspaceId, documentScope) => {
+      if (!workspaceId || (workspace !== undefined && workspace !== workspaceId)) throw new Error('Invalid transaction workspace');
+      workspace = workspaceId;
+      const signature = await sign(workspaceId);
+      if (!signature) return; // Schema owner maintenance does not require a web scope.
+      await client.query("SELECT set_config('projectos.workspace', $1, true), set_config('projectos.workspace_mac', $2, true)",
+        [workspaceId,signature]);
+      if (documentScope) {
+        const claims=JSON.stringify(documentScope);
+        const mac = await sign('docs:' + workspaceId + ':' + claims);
+        await client.query("SELECT set_config('projectos.document_scope', $1, true), set_config('projectos.document_mac', $2, true)",
+          [claims,mac]);
+      }
+    };
+    const value = await action(db);
     await client.query('COMMIT');
     return value;
   } catch (error) {
-    try { await client.query('ROLLBACK'); } catch { discard = true; }
+    if (!discard) {
+      try { await client.query('ROLLBACK'); } catch { discard = true; }
+    }
     throw error;
   } finally {
+    client.removeListener('error', onConnectionError);
     client.release(discard);
   }
 }
@@ -148,11 +194,55 @@ async function inTransaction(action, readOnly) {
 export function transaction(action) { return inTransaction(action, false); }
 export function readTransaction(action) { return inTransaction(action, true); }
 
-export function lockWorkspace(db, workspaceId) {
+export async function lockWorkspace(db, workspaceId) {
   const lock = db.dialect === 'postgres' ? ' FOR UPDATE' : '';
+  await db.scopeWorkspace?.(workspaceId);
   return db.one('SELECT version,name FROM workspaces WHERE id=?' + lock, workspaceId);
 }
 
 export async function lockBootstrap(db) {
   if (db.dialect === 'postgres') await db.one('SELECT pg_advisory_xact_lock(3804522)');
+}
+
+export async function requireWebRuntime({ verifyKey = false } = {}) {
+  if (process.env.PROJECTOS_DATABASE_MODE !== 'postgres') return;
+  if (!/^[a-f0-9]{64}$/i.test(process.env.PROJECTOS_DB_SCOPE_KEY ?? '')) {
+    throw new Error('PostgreSQL runtime signing key is required');
+  }
+  const role = await sql.one(`SELECT NOT (rolsuper OR rolbypassrls OR rolcreaterole OR rolcreatedb OR rolreplication)
+    AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_auth_members WHERE member=r.oid)
+    AND NOT has_schema_privilege(current_user,'public','CREATE')
+    AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_class WHERE relowner=r.oid AND relnamespace='public'::regnamespace)
+    AND has_column_privilege(current_user,'public.users','email','SELECT')
+    AND NOT has_column_privilege(current_user,'public.users','password_hash','SELECT')
+    AND NOT has_column_privilege(current_user,'public.records','payload','SELECT') AS allowed
+    FROM pg_catalog.pg_roles r WHERE rolname=current_user`);
+  if (!role?.allowed) throw new Error('A dedicated PostgreSQL web login is required');
+  if (verifyKey) {
+    const probe = 'projectos-readiness';
+    const configured = await readTransaction(async db => {
+      await db.scopeWorkspace(probe);
+      return (await db.one('SELECT public.projectos_verified_workspace() AS workspace'))?.workspace === probe;
+    });
+    if (!configured) throw new Error('PostgreSQL runtime signing key does not match');
+  }
+}
+
+export async function requireWorkerWorkspace(worker, workspace) {
+  if (!postgresConfigured()) return;
+  const role = await sql.one(`SELECT NOT (rolsuper OR rolbypassrls OR rolcreaterole OR rolcreatedb OR rolreplication)
+    AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_auth_members WHERE member=r.oid)
+    AND NOT has_schema_privilege(current_user,'public','CREATE')
+    AND NOT has_column_privilege(current_user,'public.users','email','SELECT')
+    AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_class WHERE relowner=r.oid AND relnamespace='public'::regnamespace)
+    AS allowed FROM pg_catalog.pg_roles r WHERE rolname=current_user`);
+  if (!role?.allowed || !workspace) throw new Error('A dedicated PostgreSQL worker login and workspace are required');
+  const scope = worker === 'monitor'
+    ? await sql.one('SELECT public.projectos_monitor_workspace() AS workspace')
+    : worker === 'reminder'
+      ? await sql.one('SELECT public.projectos_reminder_workspace() AS workspace')
+      : await sql.one(`SELECT id AS workspace FROM workspaces WHERE id=?
+          AND has_table_privilege(current_user,'public.delivery_retries','UPDATE')
+          AND NOT has_column_privilege(current_user,'public.records','payload','SELECT')`,workspace);
+  if (scope?.workspace !== workspace) throw new Error('PostgreSQL worker is outside its configured workspace');
 }

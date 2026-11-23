@@ -17,6 +17,15 @@ function validHost(host) {
     && /^[a-z0-9]+(?:[a-z0-9.-]*[a-z0-9])?$/.test(host) && host.includes('.');
 }
 
+export function probeDiagnostic(error) {
+  const code=typeof error?.code==='string'?error.code:'';
+  if (['ENOTFOUND','EAI_AGAIN','ENODATA'].includes(code)) return 'dns';
+  if (['ABORT_ERR','ETIMEDOUT','MONITOR_TIMEOUT'].includes(code)) return 'timeout';
+  if (/^(ERR_TLS_|ERR_SSL_|CERT_|DEPTH_|UNABLE_TO_|SELF_SIGNED_)/.test(code)) return 'tls';
+  if (['ECONNREFUSED','ECONNRESET','EHOSTUNREACH','ENETUNREACH'].includes(code)) return 'connection';
+  return 'unavailable';
+}
+
 export async function probeHttps(address, allowlist, { resolve = lookup, connect = request } = {}) {
   const target = new URL(address);
   if (target.protocol !== 'https:' || target.username || target.password || target.port || target.search || target.hash
@@ -45,7 +54,7 @@ export async function probeHttps(address, allowlist, { resolve = lookup, connect
       }));
       response.resume();
     });
-    req.once('timeout', () => req.destroy(new Error('HTTPS timed out')));
+    req.once('timeout', () => req.destroy(Object.assign(new Error('HTTPS timed out'),{code:'MONITOR_TIMEOUT'})));
     req.once('error', fail);
     req.end();
   });

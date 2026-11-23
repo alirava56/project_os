@@ -8,7 +8,7 @@ import { choices, priorities, priorityTones, taskStatuses, taskTones } from '@/l
 import { useDemo } from '@/lib/store';
 import type { Task, TaskStatus } from '@/lib/types';
 import { ProjectFilter, TaskForm, projectName } from './forms';
-import { Button, Empty, Field, Filter, Heading, LinkButton, Metrics, Panel, Pill, Row, SearchField, SectionBar, Segments, Table, formValues } from './ui';
+import { Button, Empty, Field, Filter, Heading, LinkButton, Metrics, Panel, Pill, Row, SearchField, SectionBar, Segments, Table } from './ui';
 
 const statuses = Object.keys(taskStatuses) as TaskStatus[];
 const initialColumnSize = 3;
@@ -86,6 +86,8 @@ export function Tasks() {
 export function TaskDetails({ id }: { id: string }) {
   const { data, change, notice } = useDemo();
   const [editing, setEditing] = useState(false);
+  const [comment, setComment] = useState('');
+  const [posting, setPosting] = useState(false);
   const task = data.tasks.find(t => t.id === id);
   if (!task) return <Empty title="وظیفه پیدا نشد" detail="شناسه وظیفه را بررسی کنید." action={<LinkButton href="/tasks">فهرست وظایف</LinkButton>} />;
   const item = task;
@@ -93,16 +95,21 @@ export function TaskDetails({ id }: { id: string }) {
   const events = data.events.filter(e => e.projectId === item.projectId && e.source === 'وظایف' && (e.detail.includes(item.id) || e.detail.includes(item.title)));
 
   function update(updateTask: (previous: Task) => Task, message: string, eventTitle?: string) {
-    change(previous => ({ ...previous, tasks:previous.tasks.map(t => t.id === item.id ? updateTask(t) : t) }),
+    return change(previous => ({ ...previous, tasks:previous.tasks.map(t => t.id === item.id ? updateTask(t) : t) }),
       message, eventTitle ? {projectId:item.projectId,title:eventTitle,detail:`${item.id} · ${item.title}`,source:'وظایف'} : undefined);
   }
-  function post(event: FormEvent<HTMLFormElement>) {
-    const form = event.currentTarget;
-    const text = formValues(event)('comment');
+  async function post(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (posting) return;
+    const submitted = comment;
+    const text = submitted.trim();
     if (!text) { notice('متن یادداشت را وارد کنید.'); return; }
     const date = now();
-    update(t => ({ ...t, comments:[...t.comments,{text,date}] }), 'یادداشت ثبت شد.', 'یادداشت وظیفه ثبت شد');
-    form.reset();
+    setPosting(true);
+    try {
+      const saved = await update(t => ({ ...t, comments:[...t.comments,{text,date}] }), 'یادداشت ثبت شد.', 'یادداشت وظیفه ثبت شد');
+      if (saved) setComment(current => current === submitted ? '' : current);
+    } finally { setPosting(false); }
   }
 
   return <>
@@ -127,7 +134,10 @@ export function TaskDetails({ id }: { id: string }) {
         </section>
         <section className="stack"><h2 className="section-title">یادداشت‌ها</h2>
           {item.comments.map((comment,index) => <Row key={index} title={comment.text} meta={dateLabel(comment.date)} icon={MessageSquare} />)}
-          <form className="form-stack" onSubmit={post}><Field label="یادداشت جدید"><textarea name="comment" rows={3} required maxLength={500} placeholder="نتیجهٔ بررسی یا تصمیم مرتبط را ثبت کنید…" /></Field><div><Button type="submit" icon={Plus}>ثبت یادداشت</Button></div></form>
+          <form className="form-stack" onSubmit={post}><Field label="یادداشت جدید"><textarea name="comment" value={comment}
+            onChange={event=>setComment(event.target.value)} rows={3} required maxLength={500} placeholder="نتیجهٔ بررسی یا تصمیم مرتبط را ثبت کنید…" /></Field>
+            <div><Button type="submit" icon={Plus} disabled={posting}>ثبت یادداشت</Button></div>
+          </form>
         </section>
       </Panel>
       <div className="stack">

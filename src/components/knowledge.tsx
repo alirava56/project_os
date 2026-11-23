@@ -69,24 +69,52 @@ export function Docs() {
 }
 
 type SourceCitation = {id:string;title:string;kind:string;href:string;updatedAt:string|null;excerpt?:string};
-type SearchExchange = {id:string;query:string;answer:string;citations:SourceCitation[];mode:'retrieval'|'llm'|'resume';externalTransmission:boolean|null;caution?:string};
+type SearchExchange = {id:string;query:string;answer:string;citations:SourceCitation[];mode:'retrieval'|'llm'|'resume'|'semantic';externalTransmission:boolean|null;caution?:string};
 const starterPrompts=['وظایف باز','مستندات پروژه','سرور و دامنه','تمدید'];
-const responseTitles={llm:'پاسخ آزمایشی مدل',retrieval:'نتایج جست‌وجوی مستند',resume:'ادامهٔ کار پروژه'};
+const responseTitles={llm:'پاسخ آزمایشی مدل',retrieval:'نتایج جست‌وجوی مستند',resume:'ادامهٔ کار پروژه',semantic:'نتایج معنایی محلی'};
 const sourceTitles:Record<string,string>={doc:'سند',task:'وظیفه',project:'پروژه',reminder:'یادآوری',activity:'رویداد'};
 export function Assistant(){
   const {data,projectScope,setProjectScope}=useDemo();
   const [allowExternal,setAllowExternal]=useState(false);
+  const [semantic,setSemantic]=useState(false);
+  const [indexMessage,setIndexMessage]=useState('');
+  const [indexProgress,setIndexProgress]=useState({after:'',total:0});
   const [query,setQuery]=useState('');
   const [exchanges,setExchanges]=useState<SearchExchange[]>([]);
   const [busy,setBusy]=useState(false);
   const [error,setError]=useState('');
+  async function indexProject() {
+    if (!projectScope || busy) return;
+    setBusy(true);setError('');setIndexMessage('');
+    try {
+      let {after,total}=indexProgress;
+      for (let page=0;page<10;page++) {
+        const response=await fetch('/api/assistant/semantic',{method:'POST',headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({action:'rebuild',projectId:projectScope,after})});
+        if (!response.ok) throw new Error('ساخت نمایهٔ محلی تأیید نشد.');
+        const result=await response.json();
+        total+=Number(result.indexed);
+        if (!result.after) {
+          setIndexProgress({after:'',total:0});
+          setIndexMessage(number(total)+' سند در نمایه ثبت شد.');
+          return;
+        }
+        after=result.after;
+        setIndexProgress({after,total});
+      }
+      setIndexMessage(number(total)+' سند در این اجرا نمایه شد.');
+    } catch {setError('ساخت نمایهٔ محلی تأیید نشد.');}
+    finally {setBusy(false);}
+  }
   async function send(text:string,intent?:'resume'){
     const value=text.trim();if(!value||busy)return;
     setBusy(true);setError('');
     try{
-      const response=await fetch('/api/assistant',{method:'POST',credentials:'same-origin',cache:'no-store',
+      const useSemantic=semantic && Boolean(projectScope) && intent!=='resume';
+      const response=await fetch(useSemantic?'/api/assistant/semantic':'/api/assistant',{method:'POST',credentials:'same-origin',cache:'no-store',
         headers:{'Content-Type':'application/json'},body:JSON.stringify(intent==='resume'
-          ? {intent,projectId:projectScope} : {question:value,projectId:projectScope||undefined,allowExternal})});
+          ? {intent,projectId:projectScope} : useSemantic ? {action:'query',question:value,projectId:projectScope}
+          : {question:value,projectId:projectScope||undefined,allowExternal})});
       const result=await response.json();
       if(!response.ok)throw Error(result.error||'جست‌وجو ناموفق بود');
       setExchanges(previous=>[{id:newId('search'),query:value,answer:result.answer,citations:result.citations||[],
@@ -115,14 +143,23 @@ export function Assistant(){
           </div>):<Empty title="پرسش خود را وارد کنید" detail="پاسخ فقط از منابع قابل دسترس Workspace استخراج می‌شود. اطلاعات محرمانه را وارد نکنید."/>}
           {busy&&<p className="muted" role="status">در حال بررسی منابع…</p>}
           {error&&<p className="form-error" role="alert">{error}</p>}
+          {indexMessage && <p className="muted" role="status">{indexMessage}</p>}
         </div>
         <div className="toolbar">
-          <Field label="پروژهٔ جست‌وجو"><select value={projectScope} onChange={event=>{setProjectScope(event.currentTarget.value);setAllowExternal(false);}}>
+          <Field label="پروژهٔ جست‌وجو"><select value={projectScope} disabled={busy} onChange={event=>{
+            setProjectScope(event.currentTarget.value);setAllowExternal(false);setSemantic(false);
+            setIndexMessage('');setIndexProgress({after:'',total:0});setExchanges([]);
+          }}>
             <option value="">همهٔ پروژه‌های مجاز</option>
             {data.projects.map(project=><option key={project.id} value={project.id}>{project.name}</option>)}
           </select></Field>
           {projectScope && <Button disabled={busy} onClick={()=>void send('ادامهٔ کار پروژه','resume')}>ادامهٔ کار این پروژه</Button>}
-          {data.users[0]?.role==='Owner'&&projectScope&&<label><input type="checkbox" checked={allowExternal}
+          {projectScope && <label><input type="checkbox" checked={semantic} disabled={busy}
+            onChange={event=>{setSemantic(event.currentTarget.checked);setAllowExternal(false);}} /> جست‌وجوی معنایی محلی</label>}
+          {semantic && projectScope && data.users[0]?.role==='Owner' && <Button disabled={busy} onClick={()=>void indexProject()}>
+            {indexProgress.after?'ادامهٔ بازسازی نمایه':'بازسازی نمایهٔ معنایی'}
+          </Button>}
+          {data.users[0]?.role==='Owner'&&projectScope&&!semantic&&<label><input type="checkbox" checked={allowExternal}
             onChange={event=>setAllowExternal(event.currentTarget.checked)} /> اجازهٔ ارسال پرسش و گزیدهٔ منابع این پروژه برای همین پاسخ</label>}
         </div>
         <form className="chat-form" onSubmit={event=>{event.preventDefault();void send(query);}}>

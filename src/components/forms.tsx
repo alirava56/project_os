@@ -6,6 +6,7 @@ import { useDemo } from '@/lib/store';
 import type { DemoData, Doc, DocType, Environment, Project, ProjectStatus, Resource, ResourceType, ResourceStatus, Task, TaskStatus, Priority, Reminder } from '@/lib/types';
 import { choices, priorities, projectStatuses, resourceStatuses, resourceTypes, taskStatuses } from '@/lib/labels';
 import { newId, now, projectHref, serverHref, taskHref, today } from '@/lib/format';
+import { localInstant, wallClock } from '@/lib/reminder-time';
 import { Callout, Field, Filter, FormActions, Modal, formValues, type Choice } from './ui';
 
 const environments = ['Development', 'Staging', 'Production'];
@@ -222,35 +223,48 @@ export function DocForm({ onClose, doc, projectId, onSaved }: {
   </Modal>;
 }
 
-export function ReminderForm({ onClose, due, projectId }: { onClose: () => void; due?: string; projectId?: string }) {
-  const { change, saving } = useDemo();
+export function ReminderForm({ onClose, due, projectId, reminder }: { onClose: () => void; due?: string; projectId?: string; reminder?: Reminder }) {
+  const { data, change, saving } = useDemo();
   const [error, setError] = useState('');
+  const initialZone = reminder?.zone ?? data.preferences.zone;
+  const local = reminder?.due.includes('T') ? wallClock(initialZone,new Date(reminder.due)) : reminder?.due;
   async function submit(event: FormEvent<HTMLFormElement>) {
     const get = formValues(event);
     if (!get('title')) { setError('عنوان رویداد را وارد کنید.'); return; }
-    const item: Reminder = { id:newId('reminder'), title:get('title'), projectId:get('project'), due:get('due'),
-      kind:get('kind') as Reminder['kind'], repeat:get('repeat') as Reminder['repeat'], zone:get('zone')||undefined,
-      noticeDays:noticeDays(get('noticeDays')) };
-    const saved = await change(data => ({ ...data, reminders:[...data.reminders,item] }), 'یادآوری ثبت شد.', { projectId:item.projectId, title:item.title, source:'تقویم' });
+    const zone = get('zone') || undefined;
+    const date = get('due');
+    const time = get('time');
+    const unchanged = reminder && local?.slice(0,10) === date && local?.slice(11,16) === time && zone === reminder.zone;
+    const dateTime = time ? localInstant(date + 'T' + time + ':00',zone ?? data.preferences.zone) : undefined;
+    if (dateTime !== undefined && !Number.isFinite(dateTime)) { setError('موعد یادآوری معتبر نیست.'); return; }
+    const item: Reminder = { id:reminder?.id ?? newId('reminder'),title:get('title'),projectId:get('project'),
+      due:unchanged ? reminder.due : dateTime === undefined ? date : new Date(dateTime).toISOString(),
+      kind:get('kind') as Reminder['kind'],repeat:get('repeat') as Reminder['repeat'],zone,
+      noticeDays:noticeDays(get('noticeDays')),paused:reminder ? get('paused') === 'on' : undefined };
+    const saved = await change(current => ({ ...current,reminders:reminder
+      ? current.reminders.map(value => value.id === item.id ? item : value) : [...current.reminders,item] }),
+    'یادآوری ثبت شد.',{projectId:item.projectId,title:item.title,source:'تقویم'});
     if (!saved) { setError('ذخیرهٔ یادآوری تأیید نشد.'); return; }
     onClose();
   }
-  return <Modal title="رویداد جدید" onClose={onClose}><form className="form-stack" onSubmit={submit}>
-    <Field label="عنوان رویداد"><input autoFocus required name="title" maxLength={90} /></Field>
-    <ProjectField initial={projectId} />
+  return <Modal title={reminder ? 'ویرایش یادآوری' : 'رویداد جدید'} onClose={onClose}><form className="form-stack" onSubmit={submit}>
+    <Field label="عنوان رویداد"><input autoFocus required name="title" maxLength={90} defaultValue={reminder?.title} /></Field>
+    <ProjectField initial={reminder?.projectId ?? projectId} />
     <div className="form-grid">
-      <Field label="نوع رویداد"><select name="kind"><SelectOptions options={['یادآوری','جلسه','تمدید']} /></select></Field>
-      <Field label="موعد (میلادی)"><input dir="ltr" required name="due" type="date" defaultValue={due ?? today()} /></Field>
-      <NoticeDaysField placeholder="زمان‌بندی پیش‌فرض" />
+      <Field label="نوع رویداد"><select name="kind" defaultValue={reminder?.kind}><SelectOptions options={['یادآوری','جلسه','تمدید']} /></select></Field>
+      <Field label="موعد (میلادی)"><input dir="ltr" required name="due" type="date" defaultValue={local?.slice(0,10) ?? due ?? today()} /></Field>
+      <Field label="ساعت محلی (اختیاری)"><input dir="ltr" name="time" type="time" defaultValue={local?.slice(11,16)} /></Field>
+      <NoticeDaysField placeholder="زمان‌بندی پیش‌فرض" initial={reminder?.noticeDays} />
     </div>
     {error && <p className="form-error" role="alert">{error}</p>}
     <div className="form-grid">
-      <Field label="تکرار"><select name="repeat"><option value="none">یک‌بار</option><option value="daily">روزانه</option>
+      <Field label="تکرار"><select name="repeat" defaultValue={reminder?.repeat ?? 'none'}><option value="none">یک‌بار</option><option value="daily">روزانه</option>
         <option value="weekly">هفتگی</option><option value="monthly">ماهانه</option><option value="yearly">سالانه</option></select></Field>
-      <Field label="منطقهٔ زمانی"><select name="zone"><option value="">منطقهٔ زمانی فضای کاری</option>
+      <Field label="منطقهٔ زمانی"><select name="zone" defaultValue={reminder?.zone ?? ''}><option value="">منطقهٔ زمانی فضای کاری</option>
         <option value="Asia/Tehran">تهران</option><option value="UTC">UTC</option><option value="Europe/Berlin">برلین</option></select></Field>
     </div>
-    <FormActions onClose={onClose} saving={saving} submit="ثبت رویداد" />
+    {reminder && <label><input name="paused" type="checkbox" defaultChecked={reminder.paused} /> توقف یادآوری</label>}
+    <FormActions onClose={onClose} saving={saving} submit={reminder ? 'ذخیرهٔ یادآوری' : 'ثبت رویداد'} />
   </form></Modal>;
 }
 

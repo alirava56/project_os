@@ -14,8 +14,8 @@ const tables = [
   ['document_versions', ['workspace_id', 'document_id', 'revision'], 'workspace_id document_id revision payload saved_at'],
   ['workspace_invites', ['id'], 'id workspace_id email role token_hash expires_at created_at redeemed_at revoked_at project_ids'],
   ['mfa_recovery_codes', ['user_id','code_hash'], 'user_id code_hash created_at'],
-  ['notification_outbox', ['id'], 'id workspace_id reminder_id scheduled_for channel state created_at delivered_at'],
-  ['delivery_retries', ['notification_id'], 'notification_id attempts retry_after claimed_at lease_token'],
+  ['notification_outbox', ['id'], 'id workspace_id reminder_id scheduled_for channel state created_at delivered_at expires_at telegram_title telegram_project'],
+  ['delivery_retries', ['notification_id'], 'notification_id attempts retry_after claimed_at lease_token dispatch_at provider_id last_error'],
   ['monitor_observations', ['id'], 'id workspace_id resource_id checked_at state status_code latency_ms diagnostic source tls_expires_at'],
   ['ai_quota', ['user_id','hourly_window'], 'user_id hourly_window used'],
   ['auth_rate_limits', ['scope','bucket'], 'scope bucket expires_at hits'],
@@ -36,7 +36,8 @@ const defaults = {
   failed_logins: 0, locked_until: 0, mfa_seed: null, mfa_pending: null, mfa_pending_session: null, mfa_pending_until: 0,
   mfa_last_step: -1, mfa_failed: 0, mfa_locked_until: 0, project_ids: null, record_version: 0, actor_snapshot: '',
   lease_token: null, source: 'https', tls_expires_at: null,
-  disk_used_bytes: null, disk_total_bytes: null,
+  disk_used_bytes: null, disk_total_bytes: null, expires_at:null, telegram_title:null, telegram_project:null,
+  dispatch_at:null, provider_id:null, last_error:null,
 };
 const mandatory = new Set(['users','workspaces','memberships','records','sessions','document_versions','audit_events','notification_outbox']);
 
@@ -61,7 +62,7 @@ function projectRow(table, row) {
 }
 
 function validateSensitive(table, row) {
-  const fields = ['title', 'display_name', 'name', 'email', 'actor_snapshot', 'action', 'diagnostic'];
+  const fields = ['title', 'display_name', 'name', 'email', 'actor_snapshot', 'action', 'diagnostic', 'telegram_title', 'telegram_project'];
   let flagged = fields.some(field => typeof row[field] === 'string' && suspiciousCredential(row[field]));
   if (Object.hasOwn(row, 'payload')) {
     try { flagged ||= suspiciousInRecord(JSON.parse(row.payload)); }
@@ -102,8 +103,9 @@ function *rows(snapshot, table) {
 function newDigest() { return createHash('sha256'); }
 function add(digest, table, values) {
   // Rows without disk samples keep their earlier import digest and can be retried.
-  const legacy = table.name === 'machine_observations' && values.at(-2) === null && values.at(-1) === null;
-  digest.update(JSON.stringify(legacy ? values.slice(0,-2) : values) + '\n');
+  const optional = {machine_observations:2,notification_outbox:3,delivery_retries:3}[table.name];
+  const stable = optional && values.slice(-optional).every(value => value === null) ? values.slice(0,-optional) : values;
+  digest.update(JSON.stringify(stable) + '\n');
 }
 
 export function manifest(snapshot) {
@@ -162,8 +164,39 @@ async function targetManifest(client) {
   return { digest: digest.digest('hex'), counts };
 }
 
+export async function verifyRollbackBoundary(pool, expected) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');
+    await client.query('SET LOCAL row_security=off');
+    const postgresOnly = ['public.vpn_observations', 'public.semantic_index', 'projectos_private.github_sync_bindings',
+      'projectos_private.github_sync_jobs', 'projectos_private.currency_schedules', 'projectos_private.slo_lifecycle'];
+    const known = [...tables.map(table => table.name), 'sqlite_imports', 'projectos_schema_migrations',
+      ...postgresOnly.filter(name => name.startsWith('public.')).map(name => name.split('.')[1])];
+    const extra = await client.query(`SELECT 1 FROM pg_tables WHERE schemaname='public'
+      AND NOT (tablename = ANY($1::text[])) LIMIT 1`, [known]);
+    for (const name of postgresOnly) {
+      const { rows } = await client.query('SELECT to_regclass($1) AS name', [name]);
+      if (rows[0].name && (await client.query('SELECT 1 FROM ' + name + ' LIMIT 1')).rowCount) {
+        throw new SourceError('Unsafe SQLite rollback: target contains PostgreSQL-only data');
+      }
+    }
+    const recorded = await client.query('SELECT 1 FROM sqlite_imports WHERE source_digest=$1', [expected.digest]);
+    if (extra.rowCount || !recorded.rowCount || (await targetManifest(client)).digest !== expected.digest) {
+      throw new SourceError('Unsafe SQLite rollback: target differs from the imported snapshot');
+    }
+    return {status:'matches_imported_snapshot',digest:expected.digest};
+  } finally {
+    const discard = await client.query('ROLLBACK').then(() => false, () => true);
+    client.release(discard);
+  }
+}
+
 export async function importSnapshot(pool, snapshot, expected, beforeCommit = async () => {}) {
   const client = await pool.connect();
+  let discard = false;
+  function onConnectionError() { discard = true; }
+  client.on('error', onConnectionError);
   try {
     await client.query('BEGIN');
     await client.query('SELECT pg_advisory_xact_lock(3804522)');
@@ -191,10 +224,11 @@ export async function importSnapshot(pool, snapshot, expected, beforeCommit = as
     await client.query('COMMIT');
     return { ...expected, status: 'imported' };
   } catch (error) {
-    await client.query('ROLLBACK').catch(() => {});
+    if (!discard) discard = await client.query('ROLLBACK').then(() => false, () => true);
     throw error;
   } finally {
-    client.release();
+    client.removeListener('error', onConnectionError);
+    client.release(discard);
   }
 }
 

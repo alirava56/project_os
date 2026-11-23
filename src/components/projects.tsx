@@ -7,7 +7,7 @@ import { Activity, Archive, ArrowUpLeft, Bell, Check, CircleAlert, Clock3, Folde
 import { dateLabel, docHref, matches, number, percent, projectHref, resourceHref, taskHref } from '@/lib/format';
 import { amountLabel } from '@/lib/money';
 import { choices, priorities, priorityTones, projectStatuses, projectTones, resourceStatuses, resourceTones, taskStatuses, taskTones } from '@/lib/labels';
-import { useDemo } from '@/lib/store';
+import { useDemo, useWorkspaceReady } from '@/lib/store';
 import type { Project, Resource, Task } from '@/lib/types';
 import { projectCompleteness } from '@/lib/completeness';
 import { Art, Button, Empty, Filter, Glyph, Heading, LinkButton, Metrics, Modal, Panel, Pill, Progress, Row, SearchField, SectionBar, Segments, Table, TextLink, visibleLink } from './ui';
@@ -130,6 +130,7 @@ function ProjectResourceRows({ resources }: { resources: Resource[] }) {
 }
 export function ProjectDetails({ id }: { id: string }) {
   const { data, change, saving, projectScope, setProjectScope } = useDemo();
+  const ready = useWorkspaceReady();
   const router = useRouter();
   const [tab, setTab] = useState<typeof projectTabs[number]['value']>('overview');
   const [modal, setModal] = useState<'edit' | 'task' | 'resource' | 'doc' | 'archive' | 'delete' | null>(null);
@@ -220,8 +221,8 @@ export function ProjectDetails({ id }: { id: string }) {
         {label:'شرح',render:e => e.title}, {label:'مبلغ',render:e => amountLabel(e)}, {label:'تاریخ',render:e => dateLabel(e.date)}, {label:'دسترسی',render:() => visibleLink('/finance','همه هزینه‌ها')},
       ]} /></Panel>}
       {isOwner && <div className="flex flex-wrap gap-2">
-        <Button variant={archived ? 'soft' : 'danger'} icon={Archive} onClick={() => setModal('archive')}>{archived ? 'بازگردانی پروژه' : 'بایگانی پروژه'}</Button>
-        {archived && <Button variant="danger" icon={Trash2} onClick={() => setModal('delete')}>حذف پروژه</Button>}
+        <Button variant={archived ? 'soft' : 'danger'} icon={Archive} disabled={!ready} onClick={() => setModal('archive')}>{archived ? 'بازگردانی پروژه' : 'بایگانی پروژه'}</Button>
+        {archived && <Button variant="danger" icon={Trash2} disabled={!ready} onClick={() => setModal('delete')}>حذف پروژه</Button>}
       </div>}
     </div>
     {modal === 'edit' && <ProjectForm project={project} onClose={() => setModal(null)} />}

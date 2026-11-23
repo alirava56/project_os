@@ -43,6 +43,12 @@ for (const width of widths) {
           page.on('console', message => {
             if (message.type() === 'error') errors.push(message.text());
           });
+          page.on('response', response => {
+            const url = new URL(response.url());
+            if (url.pathname.startsWith('/api/') && response.status() >= 500) {
+              errors.push(`${response.status()} ${url.pathname}`);
+            }
+          });
           page.on('request', request => {
             const url = new URL(request.url());
             if ((url.protocol === 'https:' || url.protocol === 'http:') && url.hostname !== '127.0.0.1') external.add(url.origin);

@@ -1,5 +1,7 @@
 import { createHash } from 'node:crypto';
 import { lockWorkspace, sql, transaction } from './database.mjs';
+import { localInstant, wallClock } from '../src/lib/reminder-time.ts';
+import { safeLabel } from './notification-providers.mjs';
 
 const dayMs = 86400_000;
 const utcDay = date => Date.parse(date + 'T00:00:00Z');
@@ -59,17 +61,21 @@ export function occurrences(value, repeat, zone, lowest, highest) {
   return found;
 }
 
-async function enqueue(db, workspace, channels, alertId, ref, scheduled, timestamp, slot = 0) {
+async function enqueue(db, workspace, channels, alertId, ref, scheduled, timestamp, expiresAt, slot = 0, details = {}) {
   let queued = 0;
   for (const channel of channels) {
     const prefix = channel === 'telegram' ? 'tg-' : 'email-';
     const id = prefix + alertId + (slot ? '-' + slot : '');
     const perOccurrence = slot ? ref + ':' + alertId + ':' + slot : ref;
-    const result = await db.run(`INSERT INTO notification_outbox(id,workspace_id,reminder_id,scheduled_for,channel,state,created_at,delivered_at)
-      VALUES(?,?,?,?,?,'pending',?,NULL) ON CONFLICT DO NOTHING`,
-    id, workspace, perOccurrence, scheduled, channel, timestamp);
-    queued += result || await db.run(`UPDATE notification_outbox SET state='pending' WHERE id=? AND state='cancelled'
-      AND NOT EXISTS (SELECT 1 FROM delivery_retries dr WHERE dr.notification_id=notification_outbox.id AND dr.attempts>=5)`, id);
+    const title = channel === 'telegram' ? safeLabel(details.title) || null : null;
+    const project = channel === 'telegram' ? safeLabel(details.project) || null : null;
+    const result = await db.run(`INSERT INTO notification_outbox(id,workspace_id,reminder_id,scheduled_for,channel,state,created_at,
+      expires_at,telegram_title,telegram_project) VALUES(?,?,?,?,?,'pending',?,?,?,?) ON CONFLICT DO NOTHING`,
+    id, workspace, perOccurrence, scheduled, channel, timestamp, expiresAt, title, project);
+    queued += result || await db.run(`UPDATE notification_outbox SET state='pending',expires_at=?,telegram_title=?,telegram_project=?
+      WHERE id=? AND state='cancelled' AND NOT EXISTS (
+        SELECT 1 FROM delivery_retries dr WHERE dr.notification_id=notification_outbox.id AND (dr.attempts>=5 OR dr.dispatch_at IS NOT NULL))`,
+    expiresAt, title, project, id);
   }
   return queued;
 }
@@ -102,13 +108,17 @@ function activeCandidates(parsed, preferences, timestamp, horizon) {
       if (!localDue || (noticeDays !== undefined && localDue > high)) continue;
       // The anchor can have a historic UTC instant; keep its established identity.
       if (due === dueDate(draft.anchor, draft.zone)) due = draft.anchor;
+      else if (due !== draft.anchor && draft.anchor.includes('T')) {
+        const time = wallClock(draft.zone,new Date(draft.anchor)).slice(11);
+        due = new Date(localInstant(due + 'T' + time,draft.zone)).toISOString();
+      }
       info.push({ ...draft, id, due, projectId: value.projectId, source:kind, today, noticeDays });
     }
   }
   return info;
 }
 
-export async function reconcileReminders({ clock = new Date(), channels = [], notificationWorkspace, offsets = [14, 7, 3, 1, 0] } = {}) {
+export async function reconcileReminders({ clock = new Date(), channels = [], notificationWorkspace, telegramDetails = false, offsets = [14, 7, 3, 1, 0] } = {}) {
   const timing = new Set(offsets);
   const horizon = Math.max(3, ...offsets);
   const totals = { generated:0, resumed:0, retired:0, queuedTelegram:0, queuedEmail:0, cancelledTelegram:0, ambiguousLegacy:0 };
@@ -120,7 +130,18 @@ export async function reconcileReminders({ clock = new Date(), channels = [], no
       const current = await lockWorkspace(db, workspace);
       if (!current) return;
       const version = current.version + 1;
-      const parsed = (await db.all('SELECT id,kind,payload FROM records WHERE workspace_id=?', workspace))
+      const rows = await db.all(`SELECT id,kind,payload FROM records WHERE workspace_id=?
+        AND kind IN ('reminders','tasks','charges','resources','contracts','preferences','incidents','secrets')`, workspace);
+      const restricted = db.dialect === 'postgres' && (await db.one('SELECT public.projectos_reminder_workspace() AS scope'))?.scope === workspace;
+      if (restricted) rows.push(...await db.all("SELECT id,'secrets' AS kind,payload FROM public.projectos_rotation_deadlines()"));
+      const projectNames = new Map();
+      if (telegramDetails && targets.includes('telegram')) {
+        const projects = restricted ? await db.all('SELECT id,name FROM public.projectos_reminder_project_names()')
+          : (await db.all("SELECT id,payload FROM records WHERE workspace_id=? AND kind='projects'",workspace))
+            .map(row => ({id:row.id,name:JSON.parse(row.payload).name}));
+        for (const project of projects) projectNames.set(project.id,project.name);
+      }
+      const parsed = rows
         .map(row => ({...row, value:JSON.parse(row.payload)}));
       const currentIncidents = parsed.filter(row => row.kind === 'incidents');
       const incidents = new Map(currentIncidents.map(row => [row.id, row.value]));
@@ -182,7 +203,7 @@ export async function reconcileReminders({ clock = new Date(), channels = [], no
         if (!localDue) continue;
         const diff = Math.round((utcDay(localDue) - utcDay(row.today)) / dayMs);
         const lead = row.noticeDays ?? (row.kind === 'تمدید' ? horizon : row.repeat && row.repeat !== 'none' ? 0 : 3);
-        if (diff < -3 || diff > lead) continue;
+        if (diff < -3 || diff > lead || (diff === 0 && lead === 0 && row.due.includes('T') && Date.parse(row.due)>clock.getTime())) continue;
         let incident = incidents.get(row.alertId);
         if (!incident) {
           incident = { id:row.alertId, title:row.name + ' · ' + localDue, projectId:row.projectId,
@@ -201,14 +222,16 @@ export async function reconcileReminders({ clock = new Date(), channels = [], no
         incident.id, workspace, row.ref, row.due, timestamp);
         if (incident.state !== 'open') continue;
         openCount++;
+        if (diff < 0 || (diff === 0 && row.due.includes('T') && Date.parse(row.due)>clock.getTime())) continue;
+        const expiry = localInstant(dayString(utcDay(row.today)+dayMs) + 'T00:00:00',row.zone);
+        const details = telegramDetails && row.source !== 'secrets' ? {title:row.name,project:projectNames.get(row.projectId)} : {};
         for (const channel of targets) {
           const first = outbox.get((channel === 'telegram' ? 'tg-' : 'email-') + incident.id);
           const scheduled = row.noticeDays === undefined && (row.kind === 'تمدید' ? timing.has(diff) : diff === 0);
           if (first && first.state !== 'cancelled' && !scheduled) continue;
-          if (!first && diff < 0) continue;
           const priorDay = first && dateAt(row.zone, new Date(first.created_at)) !== row.today;
           const slot = priorDay && scheduled && first.state !== 'cancelled' ? diff || 'due' : 0;
-          const queued = await enqueue(db, workspace, [channel], incident.id, row.ref, row.due, timestamp, slot);
+          const queued = await enqueue(db, workspace, [channel], incident.id, row.ref, row.due, timestamp, expiry, slot, details);
           if (channel === 'telegram') totals.queuedTelegram += queued;
           if (channel === 'email') totals.queuedEmail += queued;
         }
@@ -216,12 +239,13 @@ export async function reconcileReminders({ clock = new Date(), channels = [], no
       if (preferences.digest && openCount) {
         const today = dateAt(preferences.zone ?? 'Asia/Tehran', clock);
         const digestId = reminderAlertId(workspace, 'digest', 'daily', today);
-        await enqueue(db, workspace, targets, digestId, 'digest:' + today, today, timestamp);
+        await enqueue(db, workspace, targets, digestId, 'digest:' + today, today, timestamp,
+          localInstant(dayString(utcDay(today)+dayMs) + 'T00:00:00',preferences.zone ?? 'Asia/Tehran'));
       }
       if (changes) await db.run('UPDATE workspaces SET version=? WHERE id=?', version, workspace);
     });
   }
-  await sql.run(`INSERT INTO worker_heartbeats(name,checked_at) VALUES('reminders',?)
-    ON CONFLICT(name) DO UPDATE SET checked_at=excluded.checked_at`, timestamp);
+  for (const workspace of workspaces) await sql.run(`INSERT INTO worker_heartbeats(name,checked_at) VALUES(?,?)
+    ON CONFLICT(name) DO UPDATE SET checked_at=excluded.checked_at`, 'reminders/' + workspace.id, timestamp);
   return { ...totals, ranAt: timestamp, channel: 'in_app' };
 }

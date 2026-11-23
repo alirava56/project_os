@@ -1,26 +1,39 @@
 #!/usr/bin/env node
 import { createHash } from 'node:crypto';
-import { closeDatabase, lockWorkspace, sql, transaction } from './database.mjs';
-import { probeHttps } from './monitor-probe.mjs';
+import { closeDatabase, lockWorkspace, requireWorkerWorkspace, sql, transaction } from './database.mjs';
+import { configuredChannels } from './notification-delivery.mjs';
+import { probeDiagnostic, probeHttps } from './monitor-probe.mjs';
 
 const hosts = new Set((process.env.PROJECTOS_MONITOR_HOSTS ?? '').split(',').map(host => host.trim().toLowerCase()).filter(Boolean));
 const workspace = process.env.PROJECTOS_MONITOR_WORKSPACE;
 
 async function run() {
   if (!hosts.size || !workspace) throw new Error('Monitoring workspace and HTTPS hosts are required');
+  await requireWorkerWorkspace('monitor',workspace);
   const rows = await sql.all("SELECT id,payload FROM records WHERE kind='resources' AND workspace_id=? ORDER BY id", workspace);
   const candidates = rows.filter(row => {
     try { return hosts.has(new URL(JSON.parse(row.payload).address).hostname.toLowerCase()); }
     catch { return false; }
   }).slice(0,100);
+  const thresholds=[Number(process.env.PROJECTOS_SLO_MINIMUM??6),Number(process.env.PROJECTOS_SLO_CONSECUTIVE??3),
+    Number(process.env.PROJECTOS_SLO_RECOVERY??3),Number(process.env.PROJECTOS_SLO_TARGET??99.9)];
+  const [minimum,consecutive,recover,target]=thresholds;
+  if (!thresholds.every(Number.isFinite) || !thresholds.slice(0,3).every(Number.isInteger)
+    || minimum<2 || minimum>30 || consecutive<2 || consecutive>15 || recover<2 || recover>15 || target<90 || target>100) {
+    throw new Error('Invalid SLO thresholds');
+  }
+  const channels=workspace===process.env.PROJECTOS_NOTIFICATION_WORKSPACE ? Object.keys(configuredChannels(process.env)) : [];
   let tested = 0;
   // Limit parallel sockets so one maintenance cycle has predictable resource use.
   for (let offset = 0; offset < candidates.length; offset += 5) {
     await Promise.all(candidates.slice(offset,offset+5).map(async row => {
       const resource = JSON.parse(row.payload);
-      let observation;
+      let observation, diagnostic='https';
       try { observation = await probeHttps(resource.address, hosts); }
-      catch { observation = {state:'unknown', status:null, latency:null, tlsExpiresAt:null}; }
+      catch (error) {
+        diagnostic=probeDiagnostic(error);
+        observation = {state:'unknown', status:null, latency:null, tlsExpiresAt:null};
+      }
       const at = new Date().toISOString();
       await transaction(async db => {
         const scope = await lockWorkspace(db, workspace);
@@ -29,10 +42,15 @@ async function run() {
         if (!current || JSON.parse(current.payload).address !== resource.address) return;
         await db.run(`INSERT INTO monitor_observations(workspace_id,resource_id,checked_at,state,status_code,latency_ms,diagnostic,source,tls_expires_at)
           VALUES(?,?,?,?,?,?,?,'https',?) ON CONFLICT DO NOTHING`,
-        workspace,row.id,at,observation.state,observation.status,observation.latency,'HTTPS probe',observation.tlsExpiresAt);
+        workspace,row.id,at,observation.state,observation.status,observation.latency,diagnostic,observation.tlsExpiresAt);
         tested++;
         const preferences = await db.one("SELECT payload FROM records WHERE workspace_id=? AND kind='preferences' AND id='singleton'", workspace);
-        if (!preferences || !JSON.parse(preferences.payload).outage || observation.state !== 'unhealthy') return;
+        if (!preferences || !JSON.parse(preferences.payload).outage) return;
+        if (db.dialect==='postgres') {
+          await db.one('SELECT public.projectos_reconcile_slo(?,?,?,?,?,?::text[])',row.id,...thresholds,channels);
+          return;
+        }
+        if (observation.state !== 'unhealthy') return;
         const id = 'monitor-' + createHash('sha256').update(JSON.stringify([workspace,row.id])).digest('hex').slice(0,28);
         const incident = {id,projectId:JSON.parse(current.payload).projectId,title:'پاسخ ناموفق HTTPS',priority:'high',
           source:'پایش HTTPS · ثبت خودکار',date:at,state:'open'};

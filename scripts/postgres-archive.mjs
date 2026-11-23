@@ -72,7 +72,11 @@ export async function backupPostgres(destination, connectionString, passphrase) 
   const finalPath = resolve(destination);
   const {randomUUID} = await import('node:crypto');
   const temporary = join(dirname(finalPath), '.' + basename(finalPath) + '.' + randomUUID() + '.part');
-  const { child, completion } = run('pg_dump', ['--format=custom', '--no-owner', '--no-privileges', '--schema=public'], config.env);
+  const { child, completion } = run('pg_dump', ['--format=custom', '--no-owner', '--no-privileges',
+    '--schema=public', '--schema=projectos_private', '--extension=pgcrypto',
+    '--exclude-table-data=projectos_private.scope_key',
+    '--exclude-table-data=projectos_private.monitor_logins',
+    '--exclude-table-data=projectos_private.reminder_logins'], config.env);
   // Attach immediately so a short-lived pg_dump cannot exit before Node observes its stdout.
   const buffered=new PassThrough();
   const consumed=pipeline(child.stdout,buffered);

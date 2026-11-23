@@ -5,7 +5,7 @@ import { authenticate, checkOrigin, getCurrentAccount, rateLimit, readLimitedJso
 import { lockWorkspace, projectPolicy, readTransaction, storedRecord, transaction } from '@/lib/server/db';
 import { apiError, jsonError, noStore } from '@/lib/server/http';
 import { mfaEnabled, verifyMfa } from '@/lib/server/mfa';
-import { vaultSettings, verifyVaultReference } from '@/lib/server/vault';
+import { configuredVaultReference, vaultSettings, verifyVaultReference } from '@/lib/server/vault';
 import { randomUUID } from 'node:crypto';
 
 export const runtime = 'nodejs';
@@ -21,7 +21,7 @@ export async function GET(_request: NextRequest, context: Context) {
     const row = await storedRecord(db, account.workspaceId, 'secrets', id);
     if (!row) return;
     const reference = JSON.parse(row.payload) as SecretReference;
-    const configured = Boolean(reference.vaultMount && reference.vaultPath && vaultSettings(account.workspaceId)?.mounts.has(reference.vaultMount));
+    const configured = configuredVaultReference(reference, vaultSettings(account.workspaceId));
     const check = await db.one<{status:string; checkedAt:string; providerVersion:number | null}>(
       `SELECT status,checked_at AS "checkedAt",provider_version AS "providerVersion" FROM vault_checks
        WHERE workspace_id=? AND ref_id=? AND reference_version=?`, account.workspaceId, id, row.record_version);
@@ -42,6 +42,8 @@ export async function POST(request: NextRequest, context: Context) {
   let input: unknown;
   try { input = await readLimitedJson(request, 1024); }
   catch (error) { return jsonError(error); }
+  if (!input || typeof input !== 'object' || Array.isArray(input)
+    || Object.keys(input).some(key => key !== 'password' && key !== 'totp')) return apiError('Invalid verification request', 400);
   const body = input as {password?: unknown; totp?: unknown};
   const quota = await rateLimit('vault:verify', account.id, 8, 60_000);
   if (!quota.allowed) return apiError('Try again later', 429, {'Retry-After':String(quota.retryAfter)});

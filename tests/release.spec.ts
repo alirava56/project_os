@@ -341,7 +341,11 @@ test('a dated exchange rate stays attributed and converts precise values without
   await expect(page.getByText('برآورد با نرخ انتخاب‌شده · ۱۲۵ تومان')).toBeVisible();
   await expect(page.locator('time[datetime="2026-01-15T14:30:00.000Z"]')).toBeVisible();
   await page.reload();
-  await expect(page.getByText('گزارش آزمایشی نرخ ۷',{exact:true})).toBeVisible();
+  // Open the panel in the viewport before checking the source after navigation.
+  await page.getByRole('heading',{name:'تبدیل ارز با نرخ ثبت‌شده'}).scrollIntoViewIfNeeded();
+  const source=page.getByText('گزارش آزمایشی نرخ ۷',{exact:true});
+  await expect(source).toBeVisible();
+  await expect(source).toBeInViewport();
   const snapshot=(await (await page.request.get('/api/state')).json()).data;
   expect(snapshot.exchangeRates).toEqual([expect.objectContaining({rate:'123.5',from:'USD',to:'TOMAN'})]);
   expect(snapshot.expenses).toEqual([]);
@@ -567,8 +571,12 @@ test('owners can attach Vault metadata to a VPS and other roles cannot retrieve 
   } finally { await member.dispose(); }
 });
 
-test('workspace overlay triggers become available when browser scripts are ready', async ({page, origin}) => {
+test('workspace overlay and project archive become available when browser scripts are ready', async ({page, origin}) => {
   await bootstrap(page.request, origin);
+  const fixtureId='project-hydration-fixture';
+  expect((await page.request.post('/api/records/projects/'+fixtureId,{headers:origin,data:{
+    version:0,record:project(fixtureId),
+  }})).status()).toBe(200);
   let releaseScripts!: () => void;
   const ready = new Promise<void>(resolve => { releaseScripts = resolve; });
   await page.route(/\/_next\/static\/.*\.js(?:\?.*)?$/, async route => {
@@ -576,13 +584,19 @@ test('workspace overlay triggers become available when browser scripts are ready
     await route.continue();
   });
   const account = page.getByRole('button', {name:'حساب کاربری', exact:true});
+  const archive = page.getByRole('button', {name:'بایگانی پروژه', exact:true});
   try {
-    await page.goto('/dashboard', {waitUntil:'commit'});
+    await page.goto('/projects/'+fixtureId, {waitUntil:'commit'});
     await expect(account).toBeDisabled();
+    await expect(archive).toBeDisabled();
   } finally { releaseScripts(); }
   await expect(account).toBeEnabled();
   await account.click();
   await expect(page.getByRole('dialog', {name:'حساب کاربری'})).toBeVisible();
+  await page.keyboard.press('Escape');
+  await expect(archive).toBeEnabled();
+  await archive.click();
+  await expect(page.getByRole('dialog', {name:'بایگانی پروژه'})).toBeVisible();
 });
 
 test('alerts preserve independent snoozed, dismissed and resolved states after saving', async ({page, origin}) => {

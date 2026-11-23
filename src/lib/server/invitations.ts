@@ -1,6 +1,6 @@
 import { randomBytes, randomUUID } from 'node:crypto';
 import { validRecordId } from '../record-contract';
-import { accountByUser, ForbiddenError, lockWorkspace, projectPolicy, sql, storedRecord, transaction, type Account, type SqlExecutor } from './db';
+import { accountByUser, ForbiddenError, lockWorkspace, projectPolicy, readTransaction, storedRecord, transaction, type Account, type SqlExecutor } from './db';
 import { authenticate, hash, normalizeEmail, passwordHash, rateLimit, safeDisplayLabel, validatePassword } from './auth';
 import { lockIdentity, mfaEnabled, verifyMfa, verifyRecoveryCode } from './mfa';
 
@@ -43,11 +43,13 @@ export async function createInvitation(owner: Account, email: unknown, role: unk
 
 export async function listInvitations(owner: Account) {
   if (owner.role !== 'owner') throw new ForbiddenError();
-  await projectPolicy(sql, owner);
-  const list = await sql.all<{id: string; email: string; role: string; expiresAt: number; redeemedAt: number | null; revokedAt: number | null; project_ids: string | null}>(
-    `SELECT id,email,role,created_at AS "createdAt",expires_at AS "expiresAt",redeemed_at AS "redeemedAt",
-    revoked_at AS "revokedAt",project_ids FROM workspace_invites WHERE workspace_id=? ORDER BY created_at DESC LIMIT 100`,
-    owner.workspaceId);
+  const list = await readTransaction(async db => {
+    await projectPolicy(db, owner);
+    return db.all<{id: string; email: string; role: string; expiresAt: number; redeemedAt: number | null; revokedAt: number | null; project_ids: string | null}>(
+      `SELECT id,email,role,created_at AS "createdAt",expires_at AS "expiresAt",redeemed_at AS "redeemedAt",
+      revoked_at AS "revokedAt",project_ids FROM workspace_invites WHERE workspace_id=? ORDER BY created_at DESC LIMIT 100`,
+      owner.workspaceId);
+  });
   return list.map(({ project_ids, ...item }) => ({
     ...item, projectIds: project_ids === null ? null : JSON.parse(project_ids),
     active: !item.redeemedAt && !item.revokedAt && item.expiresAt > Date.now(),
@@ -72,11 +74,18 @@ export async function acceptInvitation(input: {token: unknown; email: unknown; p
     throw new InvitationError('INVALID_INVITATION');
   }
   const tokenHash = hash(token);
-  const lookup = `SELECT id,email,workspace_id,role,project_ids FROM workspace_invites
-    WHERE token_hash=? AND email=? AND revoked_at IS NULL AND redeemed_at IS NULL AND expires_at>?`;
-  const invite = await sql.one<Invite>(lookup, tokenHash, email, Date.now());
+  const capability = {purpose:'invite',email,digest:tokenHash} as const;
+  const lookup = async (db: SqlExecutor) => {
+    await db.scopeIdentity?.(capability);
+    if (db.scopeIdentity) return db.one<Invite>('SELECT id,email,workspace_id,role,project_ids FROM public.projectos_find_invite()');
+    return db.one<Invite>(`SELECT id,email,workspace_id,role,project_ids FROM workspace_invites
+      WHERE token_hash=? AND email=? AND revoked_at IS NULL AND redeemed_at IS NULL AND expires_at>?`, tokenHash, email, Date.now());
+  };
+  const {invite,existing} = await readTransaction(async db => {
+    const invite = await lookup(db);
+    return {invite,existing:invite ? await db.one<{id:string}>('SELECT id FROM users WHERE email=?',email) : undefined};
+  });
   if (!invite) throw new InvitationError('INVALID_INVITATION');
-  const existing = await sql.one<{id: string}>('SELECT id FROM users WHERE email=?', email);
   if (existing) {
     const quota = await rateLimit('invitation-password', invite.id, 6, 15 * 60_000);
     if (!quota.allowed || await authenticate(email, password) !== existing.id) throw new InvitationError('INVALID_INVITATION');
@@ -85,9 +94,11 @@ export async function acceptInvitation(input: {token: unknown; email: unknown; p
   const digest = existing ? null : await passwordHash(password, salt);
   const result = await transaction(async db => {
     await lockWorkspace(db, invite.workspace_id);
-    const current = await db.one<Invite>(lookup, tokenHash, email, Date.now());
+    const current = await lookup(db);
     if (!current) throw new InvitationError('INVALID_INVITATION');
-    const grants = await projectScope(db, current.workspace_id, current.project_ids === null ? null : JSON.parse(current.project_ids));
+    const projects = current.project_ids === null ? null : JSON.parse(current.project_ids);
+    await db.scopeWorkspace?.(current.workspace_id, {role:'invitation',projects});
+    const grants = await projectScope(db, current.workspace_id, projects);
     const id = existing?.id ?? randomUUID();
     if (existing) {
       await lockIdentity(db, id);
@@ -103,6 +114,7 @@ export async function acceptInvitation(input: {token: unknown; email: unknown; p
         ON CONFLICT(email) DO NOTHING`, id, email, name, digest, salt, new Date().toISOString());
       if (!inserted) throw new InvitationError('INVALID_INVITATION');
     }
+    await db.scopeIdentity?.(capability);
     await db.run('INSERT INTO memberships(user_id,workspace_id,role,project_ids) VALUES(?,?,?,?)',
       id, current.workspace_id, current.role, grants);
     await db.run('UPDATE workspace_invites SET redeemed_at=? WHERE id=?', Date.now(), current.id);
@@ -126,10 +138,10 @@ export async function removeMember(owner: Account, memberId: string) {
   if (owner.id === memberId) throw new InvitationError('CANNOT_REMOVE_OWNER');
   return transaction(async db => {
     await lockOwner(db, owner);
-    await lockIdentity(db, memberId);
+    if (db.dialect === 'sqlite') await lockIdentity(db, memberId);
     const row = await db.one<{role: string}>('SELECT role FROM memberships WHERE user_id=? AND workspace_id=?', memberId, owner.workspaceId);
     if (!row || row.role === 'owner') throw new InvitationError('CANNOT_REMOVE_OWNER');
-    await db.run('DELETE FROM sessions WHERE user_id=?', memberId);
+    if (db.dialect === 'sqlite') await db.run('DELETE FROM sessions WHERE user_id=?', memberId);
     return await db.run('DELETE FROM memberships WHERE workspace_id=? AND user_id=?', owner.workspaceId, memberId) === 1;
   });
 }

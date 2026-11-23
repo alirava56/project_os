@@ -1,6 +1,6 @@
 /** RFC 6238 SHA-1 TOTP with encrypted-at-rest per-user seeds. Requires independent deployment key. */
 import {createHmac, createHash, randomBytes, createCipheriv, createDecipheriv, timingSafeEqual} from 'node:crypto';
-import {sql, transaction, type SqlExecutor} from './db';
+import {readTransaction, sql, transaction, type SqlExecutor} from './db';
 function key():Buffer {
   const text=process.env.PROJECTOS_MFA_ENCRYPTION_KEY;
   if(!text||!/^[a-f0-9]{64}$/i.test(text))throw new Error('MFA_KEY_NOT_CONFIGURED');
@@ -47,15 +47,26 @@ function matchStep(seed:string,code:unknown,lastStep=-1):number|null {
   return null;
 }
 export async function lockIdentity(db: SqlExecutor, userId: string) {
+  await db.scopeIdentity?.({purpose:'mfa',userId});
   const lock = db.dialect === 'postgres' ? ' FOR UPDATE' : '';
   return db.one<{id: string}>('SELECT id FROM users WHERE id=?' + lock, userId);
 }
 
-export async function mfaEnabled(userId: string, db = sql) {
+export async function mfaEnabled(userId: string, db?: SqlExecutor): Promise<boolean> {
+  if (!db) return readTransaction(async connection => {
+    await connection.scopeIdentity?.({purpose:'identity',userId});
+    return mfaEnabled(userId,connection);
+  });
+  if (db.scopeIdentity) return (await db.one<{enabled:boolean}>('SELECT public.projectos_mfa_enabled() AS enabled'))?.enabled === true;
   return Boolean(await db.one('SELECT id FROM users WHERE id=? AND mfa_seed IS NOT NULL', userId));
 }
 
-export async function beginMfa(userId: string, email: string, session: string | null = null, db = sql) {
+export async function beginMfa(userId: string, email: string, session: string | null = null, db = sql):
+Promise<{secret:string; provisioningUrl:string}> {
+  if (db === sql) return transaction(async connection => {
+    await lockIdentity(connection,userId);
+    return beginMfa(userId,email,session,connection);
+  });
   const seed = b32(randomBytes(20));
   await db.run('UPDATE users SET mfa_pending=?,mfa_pending_until=?,mfa_pending_session=? WHERE id=?',
     encrypt(seed), Date.now() + 10 * 60_000, session, userId);
@@ -66,9 +77,10 @@ export async function beginMfa(userId: string, email: string, session: string | 
 export async function confirmMfa(userId: string, code: unknown, session: string | null = null, db?: SqlExecutor): Promise<boolean> {
   if (!db) return transaction(connection => confirmMfa(userId, code, session, connection));
   await lockIdentity(db, userId);
-  const row = await db.one<{pending: string | null; expires: number; binding: string | null}>(
-    'SELECT mfa_pending AS pending,mfa_pending_until AS expires,mfa_pending_session AS binding FROM users WHERE id=?', userId,
-  );
+  type Pending = {pending: string | null; expires: number; binding: string | null};
+  const row = db.scopeIdentity
+    ? await db.one<Pending>('SELECT pending,expires,binding FROM public.projectos_mfa_material()')
+    : await db.one<Pending>('SELECT mfa_pending AS pending,mfa_pending_until AS expires,mfa_pending_session AS binding FROM users WHERE id=?', userId);
   if (!row?.pending || row.expires < Date.now() || row.binding !== session) return false;
   const step = matchStep(decrypt(row.pending), code);
   if (step === null) return false;
@@ -79,9 +91,10 @@ export async function confirmMfa(userId: string, code: unknown, session: string 
 export async function verifyMfa(userId: string, code: unknown, db?: SqlExecutor): Promise<boolean> {
   if (!db) return transaction(connection => verifyMfa(userId, code, connection));
   await lockIdentity(db, userId);
-  const row = await db.one<{seed: string | null; lastStep: number; failed: number; locked: number}>(
-    'SELECT mfa_seed AS seed,mfa_last_step AS "lastStep",mfa_failed AS failed,mfa_locked_until AS locked FROM users WHERE id=?', userId,
-  );
+  type Factor = {seed: string | null; lastStep: number; failed: number; locked: number};
+  const row = db.scopeIdentity
+    ? await db.one<Factor>('SELECT seed,"lastStep",failed,locked FROM public.projectos_mfa_material()')
+    : await db.one<Factor>('SELECT mfa_seed AS seed,mfa_last_step AS "lastStep",mfa_failed AS failed,mfa_locked_until AS locked FROM users WHERE id=?', userId);
   const now = Date.now();
   if (!row?.seed || row.locked > now) return false;
   const step = matchStep(decrypt(row.seed), code, row.lastStep);
@@ -112,12 +125,18 @@ export async function verifyRecoveryCode(userId: string, code: unknown, db?: Sql
   if (typeof code !== 'string' || !/^[A-Za-z0-9_-]{22}$/.test(code)) return false;
   if (!db) return transaction(connection => verifyRecoveryCode(userId, code, connection));
   await lockIdentity(db, userId);
-  const removed = await db.run('DELETE FROM mfa_recovery_codes WHERE user_id=? AND code_hash=?', userId, recoveryHash(code));
-  if (removed !== 1) return false;
+  const digest = recoveryHash(code);
+  const removed = db.scopeIdentity
+    ? (await db.one<{removed:boolean}>('SELECT public.projectos_consume_recovery(?) AS removed',digest))?.removed
+    : await db.run('DELETE FROM mfa_recovery_codes WHERE user_id=? AND code_hash=?', userId, digest) === 1;
+  if (!removed) return false;
   await db.run('DELETE FROM sessions WHERE user_id=?', userId);
   return true;
 }
 
 export async function remainingRecoveryCodes(userId: string) {
-  return (await sql.one<{n: number}>('SELECT COUNT(*) AS n FROM mfa_recovery_codes WHERE user_id=?', userId))?.n ?? 0;
+  return readTransaction(async db => {
+    await db.scopeIdentity?.({purpose:'identity',userId});
+    return (await db.one<{n: number}>('SELECT COUNT(user_id) AS n FROM mfa_recovery_codes WHERE user_id=?', userId))?.n ?? 0;
+  });
 }

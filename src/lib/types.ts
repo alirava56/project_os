@@ -78,6 +78,8 @@ export interface Incident {
   date: string;
   state: 'open' | 'acknowledged' | 'snoozed' | 'resolved' | 'dismissed';
   snoozedUntil?: string;
+  endedAt?: string;
+  durationSeconds?: number;
 }
 export interface Expense {
   id: string;
@@ -107,12 +109,12 @@ export interface RevenueEntry {
 export interface InvoiceInstallment { dueOn:string; amount:number }
 export interface ExchangeRate {
   id:string; projectId:string; from:CurrencyUnit; to:CurrencyUnit; rate:string;
-  source:string; observedAt:string;
+  source:string; observedAt:string; receivedAt?:string;
 }
 export interface Invoice {
   id:string; projectId:string; reference:string; title:string; direction:'receivable'|'payable';
   amount:number; currency:CurrencyUnit; amountUnit:'minor'; issuedOn:string; dueOn:string;
-  state:'open'|'void'; installments?:InvoiceInstallment[];
+  state:'open'|'void'; installments?:InvoiceInstallment[]; contractId?:string;
 }
 export interface Payment {
   id:string; projectId:string; invoiceId:string; reference:string;

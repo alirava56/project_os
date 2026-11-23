@@ -1,48 +1,25 @@
-import { execFileSync } from 'node:child_process';
-import { randomBytes } from 'node:crypto';
 import { access, mkdtemp, rm } from 'node:fs/promises';
-import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { join } from 'node:path';
 import { expect, test, type Page } from '@playwright/test';
 import { setupToken, startTestApp } from './isolated-app';
-
-type AdminConnection = {
-  connect(): Promise<void>;
-  query(statement: string): Promise<unknown>;
-  end(): Promise<void>;
-};
-const PgClient: new (options: {connectionString: string}) => AdminConnection =
-  createRequire(resolve('package.json'))('pg').Client;
+import { createPostgresFixture } from './postgres-fixture';
 const email = 'lifecycle-owner@example.test';
 const password = 'synthetic-lifecycle-e2e-password';
 
 const pgTest = test.extend<{ app: { url: string; restart(): Promise<string> } }>({
   ignoreHTTPSErrors: async ({app},provide) => { await provide(app.url.startsWith('https://127.0.0.1:')); },
   app: async ({playwright}, provide) => {
-    const adminUrl = new URL(process.env.PROJECTOS_TEST_POSTGRES_URL ?? 'file:/');
-    if (!['postgres:', 'postgresql:'].includes(adminUrl.protocol)
-      || !['127.0.0.1', 'localhost'].includes(adminUrl.hostname) || adminUrl.pathname !== '/postgres') {
-      throw new Error('Set PROJECTOS_TEST_POSTGRES_URL to an isolated loopback PostgreSQL admin database');
-    }
-    const database = 'projectos_test_lifecycle_' + randomBytes(8).toString('hex');
-    const postgresUrl = new URL('/' + database, adminUrl).href;
     const dir = await mkdtemp(join(tmpdir(), 'projectos-lifecycle-'));
     const sqlitePath = join(dir, 'must-not-exist.sqlite');
-    const admin = new PgClient({connectionString:adminUrl.href});
-    let created = false;
+    let database: Awaited<ReturnType<typeof createPostgresFixture>> | undefined;
     let server: Awaited<ReturnType<typeof startTestApp>> | undefined;
     try {
-      await admin.connect();
-      await admin.query('CREATE DATABASE "' + database + '"');
-      created = true;
-      const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^PROJECTOS_/i.test(key)));
-      execFileSync(process.execPath, [resolve('scripts/migrate-postgres.mjs')], {
-        env: {...env, NODE_ENV:'test', PROJECTOS_DATABASE_URL:postgresUrl}, timeout:30_000, stdio:'pipe',
-      });
+      const fixture = await createPostgresFixture();
+      database = fixture;
       async function restart() {
         await server?.stop();
-        server = await startTestApp({sqlitePath, postgresUrl});
+        server = await startTestApp({sqlitePath, postgresUrl:fixture.url, postgresScopeKey:fixture.scopeKey});
         return server.url;
       }
       const url = await restart();
@@ -57,10 +34,9 @@ const pgTest = test.extend<{ app: { url: string; restart(): Promise<string> } }>
     } finally {
       try {
         await server?.stop();
-        if (created) await admin.query('DROP DATABASE "' + database + '"');
       } finally {
-        await admin.end();
-        await rm(dir, {recursive:true, force:true, maxRetries:5});
+        try { await database?.dispose(); }
+        finally { await rm(dir, {recursive:true, force:true, maxRetries:5}); }
       }
     }
   },

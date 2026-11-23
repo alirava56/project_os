@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { readJsonBytes } from '@/lib/server/auth';
-import { sql, storedRecord, transaction } from '@/lib/server/db';
+import { requireWebRuntime, storedRecord, transaction } from '@/lib/server/db';
 import { deliveryDigest, githubBindings, signedDelivery } from '@/lib/server/github';
 import { apiError, jsonError, noStore } from '@/lib/server/http';
 
@@ -18,6 +18,7 @@ export async function POST(request: NextRequest) {
   try { raw = await readJsonBytes(request, 512_000); }
   catch (error) { return jsonError(error); }
   if (!signedDelivery(raw, request.headers.get('x-hub-signature-256'), key)) return apiError('Signature rejected', 401);
+  await requireWebRuntime();
   let repository: unknown;
   try { repository = JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(raw))?.repository?.full_name; }
   catch { return apiError('Invalid JSON', 400); }
@@ -26,8 +27,14 @@ export async function POST(request: NextRequest) {
   const digest = deliveryDigest(raw);
   let accepted = 0;
   for (const binding of matches) {
-    if (!await storedRecord(sql, binding.workspaceId, 'projects', binding.projectId)) continue;
     accepted += await transaction(async db => {
+      await db.scopeWorkspace?.(binding.workspaceId,{role:'github',projects:[binding.projectId],repository:binding.repository});
+      if (db.scopeIdentity) {
+        const accepted = await db.one<{recorded:boolean}>('SELECT public.projectos_record_github_delivery(?,?,?) AS recorded',
+          deliveryId,digest,event);
+        return Number(accepted?.recorded === true);
+      }
+      if (!await storedRecord(db, binding.workspaceId, 'projects', binding.projectId)) return 0;
       const at = new Date().toISOString();
       const inserted = await db.run(`INSERT INTO github_deliveries(workspace_id,project_id,repo,delivery_id,payload_hash,event_type,received_at)
         VALUES(?,?,?,?,?,?,?) ON CONFLICT DO NOTHING`, binding.workspaceId, binding.projectId, binding.repository,

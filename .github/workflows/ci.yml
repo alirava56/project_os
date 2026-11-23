@@ -64,6 +64,56 @@ jobs:
       - run: npm run test:postgres-http
       - run: npx playwright install --with-deps chromium
       - run: npm run test:project-lifecycle
+      - name: Create loopback TLS fixture
+        run: |
+          fixture_dir="$RUNNER_TEMP/projectos-tls"
+          mkdir -p "$fixture_dir"
+          openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=127.0.0.1 \
+            -addext 'subjectAltName=IP:127.0.0.1' -keyout "$fixture_dir/loopback.key" -out "$fixture_dir/loopback.crt"
+          echo "PROJECTOS_TEST_TLS_KEY=$fixture_dir/loopback.key" >> "$GITHUB_ENV"
+          echo "PROJECTOS_TEST_TLS_CERT=$fixture_dir/loopback.crt" >> "$GITHUB_ENV"
+      - run: npm run test:postgres-browser -- --browser=chromium
+
+  cross-browser:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        browser: [firefox, webkit]
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: projectos_test
+          POSTGRES_PASSWORD: projectos-ci-disposable-fixture
+        options: >-
+          --health-cmd "pg_isready -U projectos_test -d postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+        ports:
+          - 5432:5432
+    env:
+      PROJECTOS_TEST_POSTGRES_URL: postgresql://projectos_test:projectos-ci-disposable-fixture@127.0.0.1:5432/postgres
+      PROJECTOS_PG_BIN: /usr/lib/postgresql/16/bin
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci --include=optional
+      - run: npm run build
+      - run: sudo apt-get update && sudo apt-get install -y postgresql-client-16
+      - run: npx playwright install --with-deps ${{ matrix.browser }}
+      - name: Create loopback TLS fixture
+        run: |
+          fixture_dir="$RUNNER_TEMP/projectos-tls"
+          mkdir -p "$fixture_dir"
+          openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=127.0.0.1 \
+            -addext 'subjectAltName=IP:127.0.0.1' -keyout "$fixture_dir/loopback.key" -out "$fixture_dir/loopback.crt"
+          echo "PROJECTOS_TEST_TLS_KEY=$fixture_dir/loopback.key" >> "$GITHUB_ENV"
+          echo "PROJECTOS_TEST_TLS_CERT=$fixture_dir/loopback.crt" >> "$GITHUB_ENV"
+      - run: npm run test:postgres-browser -- --browser=${{ matrix.browser }}
 
   codeql:
     runs-on: ubuntu-24.04

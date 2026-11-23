@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import {
-  authenticate, checkOrigin, getSessionAccount, hash, newSession, rateLimit, readLimitedJson, readSessionToken, setSessionCookie,
+  authenticate, checkOrigin, getSessionAccount, hash, newSession, rateLimit, readLimitedJson, readSessionToken, sessionActive, setSessionCookie,
 } from '@/lib/server/auth';
 import { transaction } from '@/lib/server/db';
 import { apiError, jsonError, noStore } from '@/lib/server/http';
@@ -34,7 +34,7 @@ export async function POST(request: NextRequest) {
   try {
     const result = await transaction(async db => {
       await lockIdentity(db, account.id);
-      const active = await db.one('SELECT token_hash FROM sessions WHERE token_hash=? AND user_id=?', sessionHash, account.id);
+      const active = await sessionActive(db,account.id,sessionHash);
       if (!active) return { status: 401 as const };
       const enabled = await mfaEnabled(account.id, db);
       if (action === 'start') {
