@@ -4,6 +4,74 @@ import { configuredChannels } from './notification-providers.mjs';
 import { localProvider, providerFixtureEnv, reply } from './test-provider-http.mjs';
 import { vaultSettings, verifyVaultReference } from '../src/lib/server/vault.ts';
 import { localInstant,wallClock } from '../src/lib/reminder-time.ts';
+import { latestHandshake,localTunnelService,wireGuardEvidence } from './vpn-evidence.mjs';
+import { validVpnEvidence,vpnState,vpnSummary } from '../src/lib/vpn-observation.ts';
+
+test('VPN evidence keeps WireGuard and application reachability distinct, validated and time bounded', async () => {
+  const now=Date.parse('2026-11-20T10:00:00Z');
+  const peer='A'.repeat(43)+'=';
+  const recent=Math.floor(now/1000)-30;
+  const stamp=new Date(recent*1000).toISOString();
+  const fixture=[peer+'\t0',peer+'\t'+recent].join('\n');
+  assert.equal(latestHandshake(fixture,now),stamp);
+  assert.throws(()=>latestHandshake(peer+'\t'+(recent+60),now));
+  const wg=await wireGuardEvidence('fixture0',async (bin,args,opts)=>{
+    assert.equal(bin,'wg');
+    assert.deepEqual(args,['show','fixture0','latest-handshakes']);
+    assert.equal(opts.timeout,3500);
+    return {stdout:fixture};
+  },now);
+  assert.deepEqual(wg,{wireguardState:'observed',handshakeAt:stamp});
+  assert.deepEqual(await wireGuardEvidence('fixture0',async()=>{throw new Error('fixture permission');},now),
+    {wireguardState:'unavailable',handshakeAt:null});
+  await assert.rejects(wireGuardEvidence('--fixture',async()=>{assert.fail('invalid interface executed');}),/Invalid/);
+  await assert.rejects(localTunnelService('https://example.test/health',async()=>{assert.fail('nonlocal request');}),/Invalid/);
+  const url='https://127.0.0.1:8443/health';
+  const succeeded=await localTunnelService(url,async (uri,opts)=>{
+    assert.equal(uri.href,url);
+    assert.equal(opts.redirect,'error');
+    assert.equal(opts.method,'HEAD');
+    return new Response(null,{status:204});
+  });
+  assert.equal(succeeded.serviceState,'ok');
+  assert.ok(Number.isInteger(succeeded.latencyMs));
+  const failures=[
+    [async()=>new Response(null,{status:200}), 'unexpected'],
+    [async()=>{throw new DOMException('fixture','TimeoutError');}, 'timeout'],
+    [async()=>{throw new Error('fixture',{cause:{code:'ECONNREFUSED'}});}, 'connection'],
+    [async()=>{throw new Error('fixture',{cause:{code:'CERT_HAS_EXPIRED'}});}, 'tls'],
+  ];
+  for (const [fixtureRequest,state] of failures) {
+    assert.deepEqual(await localTunnelService(url,fixtureRequest),{serviceState:state,latencyMs:null});
+  }
+  const done={...wg,...succeeded,resourceId:'fixture',checkedAt:new Date(now).toISOString()};
+  const evidence={...wg,...succeeded};
+  assert.equal(validVpnEvidence(evidence,now),true);
+  assert.equal(validVpnEvidence({...evidence,latencyMs:5001},now),false);
+  assert.equal(vpnState(done,now),'handshake_and_service');
+  assert.equal(vpnState({...done,handshakeAt:null},now),'service_only');
+  assert.equal(vpnState(done,now+16*60_000),'stale');
+  const previous={...done,checkedAt:new Date(now-2000).toISOString(),serviceState:'timeout',latencyMs:null};
+  assert.equal(vpnState(previous,now),'handshake_only');
+  assert.equal(vpnSummary([done,previous],now)[0].recovered,true);
+});
+
+test('SLO outbox sends a generic outage notice with the existing delivery adapter', async () => {
+  const deliveries=[];
+  const channels=configuredChannels({
+    PROJECTOS_EMAIL_NOTIFICATIONS:'enabled',PROJECTOS_RESEND_API_KEY:'synthetic-fixture-only',
+    PROJECTOS_EMAIL_FROM:'fixture@example.test',PROJECTOS_EMAIL_TO:'receiver@example.test',
+  },async (_url,options)=>{
+    deliveries.push(JSON.parse(options.body));
+    return Response.json({id:'7103bcef-b726-4bd7-ba8b-0d3fe7ed636d'});
+  });
+  const generic={id:'email-monitor-'+'a'.repeat(28),scheduled_for:'2026-11-20T10:00:00Z',
+    telegram_title:'Project information stays inside ProjectOS'};
+  assert.equal((await channels.email(generic)).kind,'accepted');
+  assert.equal(deliveries[0].subject,'هشدار اختلال ProjectOS');
+  assert.ok(deliveries[0].text.includes('هشدار اختلال'));
+  assert.ok(!JSON.stringify(deliveries).includes(generic.telegram_title));
+});
 
 test('Vault contract accepts active KV v2 metadata and reports authorization, missing references and outages', async t => {
   const requests = [];

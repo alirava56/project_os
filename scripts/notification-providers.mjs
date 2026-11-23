@@ -52,8 +52,13 @@ function dateText(scheduled) {
   }).format(date);
 }
 
-function textMessage(date) {
-  return 'یک یادآوری برای ' + date + ' ثبت شده است. برای مشاهدهٔ جزئیات وارد ProjectOS شوید.';
+function isSloAlert(id) {
+  return /^(?:tg-|email-)monitor-[a-f0-9]{28}$/.test(id ?? '');
+}
+
+function textMessage(date, id) {
+  const label = isSloAlert(id) ? 'یک هشدار اختلال' : 'یک یادآوری';
+  return label + ' برای ' + date + ' ثبت شده است. برای مشاهدهٔ جزئیات وارد ProjectOS شوید.';
 }
 
 function address(value) {
@@ -70,8 +75,8 @@ export function configuredChannels(env, send = fetch, timeoutMs = 10_000) {
   const options = () => ({method:'POST',redirect:'error',cache:'no-store',signal:AbortSignal.timeout(timeoutMs)});
   if (env.PROJECTOS_TELEGRAM_NOTIFICATIONS === 'enabled' && /^\d{5,}:[a-zA-Z0-9_-]{20,}$/.test(telegram ?? '')
     && /^-?\d{4,20}$/.test(chat ?? '')) {
-    channels.telegram = async ({scheduled_for,telegram_title,telegram_project}) => {
-      const content = [textMessage(dateText(scheduled_for))];
+    channels.telegram = async ({id,scheduled_for,telegram_title,telegram_project}) => {
+      const content = [textMessage(dateText(scheduled_for),id)];
       if (env.PROJECTOS_TELEGRAM_PROJECT_DETAILS === 'enabled') {
         const project = safeLabel(telegram_project), title = safeLabel(telegram_title);
         if (project) content.push('پروژه ' + project);
@@ -92,12 +97,13 @@ export function configuredChannels(env, send = fetch, timeoutMs = 10_000) {
   if (env.PROJECTOS_EMAIL_NOTIFICATIONS === 'enabled' && /^[A-Za-z0-9_-]{8,256}$/.test(key ?? '')
     && address(env.PROJECTOS_EMAIL_FROM) && address(env.PROJECTOS_EMAIL_TO)) {
     channels.email = async ({id,scheduled_for}) => {
-      const text = textMessage(dateText(scheduled_for));
+      const text = textMessage(dateText(scheduled_for),id);
       try {
         const response = await send('https://api.resend.com/emails', {
           ...options(),headers:{...types,Authorization:'Bearer ' + key,'Idempotency-Key':id},
           body:JSON.stringify({from:env.PROJECTOS_EMAIL_FROM,to:[env.PROJECTOS_EMAIL_TO],
-            subject:'یادآوری ProjectOS',text,html:'<div lang="fa" dir="rtl"><p>' + text + '</p></div>'}),
+            subject:isSloAlert(id)?'هشدار اختلال ProjectOS':'یادآوری ProjectOS',
+            text,html:'<div lang="fa" dir="rtl"><p>' + text + '</p></div>'}),
         });
         if (!response.ok) {
           await response.body?.cancel();

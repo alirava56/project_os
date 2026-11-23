@@ -37,4 +37,5 @@ GRANT SELECT, INSERT ON monitor_observations TO :"monitor_role";
 GRANT USAGE ON SEQUENCE monitor_observations_id_seq TO :"monitor_role";
 GRANT SELECT, INSERT ON worker_heartbeats TO :"monitor_role";
 GRANT UPDATE (checked_at) ON worker_heartbeats TO :"monitor_role";
+GRANT EXECUTE ON FUNCTION public.projectos_reconcile_slo(text,integer,integer,integer,numeric,text[]) TO :"monitor_role";
 COMMIT;

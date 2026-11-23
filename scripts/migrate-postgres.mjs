@@ -24,6 +24,11 @@ const migrations = [
   ['020_record_projection', new URL('../schema/postgres/020_record_projection.sql', import.meta.url)],
   ['021_private_role_boundaries', new URL('../schema/postgres/021_private_role_boundaries.sql', import.meta.url)],
   ['022_notification_lifecycle', new URL('../schema/postgres/022_notification_lifecycle.sql', import.meta.url)],
+  ['023_github_sync', new URL('../schema/postgres/023_github_sync.sql', import.meta.url)],
+  ['024_scheduled_rates', new URL('../schema/postgres/024_scheduled_rates.sql', import.meta.url)],
+  ['025_slo_incidents', new URL('../schema/postgres/025_slo_incidents.sql', import.meta.url)],
+  ['026_vpn_observations', new URL('../schema/postgres/026_vpn_observations.sql', import.meta.url)],
+  ['027_semantic_index', new URL('../schema/postgres/027_semantic_index.sql', import.meta.url)],
 ];
 const client = await getPostgresPool().connect();
 try {

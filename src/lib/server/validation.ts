@@ -18,7 +18,7 @@ const ruleSets={
     vaultProvider:s(160),lastCheckedAt:s(32,true),externalRef:s(500,true),vaultMount:s(80,true),vaultPath:s(240,true),rotationDue:s(32,true)},
   reminders:{id:s(100),title:s(180),projectId:s(100),due:s(32),kind:s(20,false,['جلسه','تمدید','یادآوری']),
     repeat:s(20,true,['none','daily','weekly','monthly','yearly']),zone:s(100,true),noticeDays:n(60,true),paused:{type:'boolean',optional:true}},
-  incidents:{id:s(100),title:s(200),projectId:s(100),priority:s(20,false,['high','medium','low']),source:s(140),date:s(32),state:s(20,false,['open','acknowledged','snoozed','resolved','dismissed']),snoozedUntil:s(32,true)},
+  incidents:{id:s(100),title:s(200),projectId:s(100),priority:s(20,false,['high','medium','low']),source:s(140),date:s(32),state:s(20,false,['open','acknowledged','snoozed','resolved','dismissed']),snoozedUntil:s(32,true),endedAt:s(32,true),durationSeconds:n(1e9,true)},
   expenses:{id:s(100),title:s(160),projectId:s(100),category:s(30,false,['زیرساخت','دامنه','پشتیبان‌گیری','اشتراک']),amount:n(1e12),currency:s(10,true,['TOMAN','IRR','USD']),amountUnit:s(10,true,['minor']),date:s(32),status:s(20,false,['paid','upcoming'])},
   charges:{id:s(100),projectId:s(100),title:s(160),provider:s(120),amount:n(1e12),currency:s(10,false,['TOMAN','IRR','USD']),amountUnit:s(10,true,['minor']),period:s(20,false,['monthly','quarterly','yearly']),nextDue:s(32),status:s(15,false,['active','paused']),linkedResourceId:s(100,true)},
   contracts:{id:s(100),projectId:s(100),title:s(160),client:s(160),start:s(32),end:s(32),amount:n(1e12),currency:s(10,false,['TOMAN','IRR','USD']),amountUnit:s(10,true,['minor']),state:s(15,false,['draft','active','completed'])},
@@ -158,6 +158,10 @@ export function parseRecord<Kind extends Collection>(kind: Kind, item: unknown):
       }
       break;
     }
+    case 'incidents':
+      if (clean.endedAt!==undefined) checkDate(clean.endedAt);
+      if (clean.durationSeconds!==undefined && (!Number.isSafeInteger(clean.durationSeconds) || Number(clean.durationSeconds)<0)) bad('Invalid incident duration');
+      break;
     case 'expenses':
     case 'revenues': checkDate(clean.date); break;
     case 'charges': checkDate(clean.nextDue); break;

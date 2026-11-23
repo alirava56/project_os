@@ -3,6 +3,7 @@ import { validRecordId } from '../record-contract';
 import { redactCredentials } from './credential-guard';
 
 export type RepositoryBinding = { workspaceId: string; projectId: string; repository: string };
+export type JobProgress = {state:string;stage:string;page:number;error:string|null};
 export type RepositorySnapshot = {
   repository: string;
   state: 'connected' | 'unknown' | 'rate_limited' | 'pending_refresh' | 'stale';
@@ -17,6 +18,7 @@ export type RepositorySnapshot = {
   latestDeployment?: {id: number; state: string} | null;
   retryAt?: string;
   lastSuccessfulAt?: string;
+  job?: JobProgress;
 };
 
 export function githubBindings(value = process.env.PROJECTOS_GITHUB_PROJECTS): RepositoryBinding[] {
@@ -47,7 +49,8 @@ export function signedDelivery(raw: Buffer, signature: string | null, key: strin
 export function deliveryDigest(raw: Buffer) { return createHash('sha256').update(raw).digest('hex'); }
 
 class GitHubUnavailable extends Error {
-  constructor(readonly retryAt?: string) { super('GitHub request unavailable'); }
+  readonly retryAt?:string;
+  constructor(retryAt?:string) { super('GitHub request unavailable'); this.retryAt=retryAt; }
 }
 
 function retryTime(response: Response, now: number) {
@@ -87,19 +90,54 @@ export function retainRepositorySnapshot(next:RepositorySnapshot, previous?:Repo
   return previous && lastSuccessfulAt ? {...previous,...next,lastSuccessfulAt} : next;
 }
 
+async function readGitHubJson(response:Response) {
+  const reader=response.body?.getReader();
+  if (!reader) throw new Error('Empty GitHub response');
+  let size=0, body='';
+  const decoder=new TextDecoder('utf-8',{fatal:true});
+  try {
+    for (;;) {
+      const {done,value}=await reader.read();
+      if (done) return JSON.parse(body+decoder.decode());
+      size+=value.length;
+      if (size>2*1024*1024) {await reader.cancel();throw new Error('GitHub response exceeds size limit');}
+      body+=decoder.decode(value,{stream:true});
+    }
+  } finally {reader.releaseLock();}
+}
+
+async function githubGet(repository:string,path:string,token:string,request:typeof fetch,now:number) {
+  const result=await request('https://api.github.com/repos/'+repository+path,{
+    headers:{Authorization:'Bearer '+token,Accept:'application/vnd.github+json','X-GitHub-Api-Version':'2022-11-28'},
+    cache:'no-store',redirect:'error',signal:AbortSignal.timeout(8500),
+  });
+  if (!result.ok) {
+    const limited=result.status===429 || (result.status===403 &&
+      (result.headers.has('retry-after') || result.headers.get('x-ratelimit-remaining')==='0'));
+    await result.body?.cancel();
+    throw new GitHubUnavailable(limited?retryTime(result,now):undefined);
+  }
+  const more=/(?:^|,)\s*<[^>]+>;\s*rel="next"/i.test(result.headers.get('link')??'');
+  return {body:await readGitHubJson(result),more};
+}
+
+export async function readGitHubBackfillPage(repository:string, kind:'commits'|'issues', page:number, anchor:string,
+  token:string, request=fetch) {
+  const suffix=kind==='commits' ? '&until='+encodeURIComponent(anchor) : '&state=open&sort=created&direction=asc';
+  const {body,more}=await githubGet(repository,'/'+kind+'?per_page=10&page='+page+suffix,token,request,Date.now());
+  const items=kind==='commits'
+    ? records<Commit>(body).flatMap(({sha,commit})=>gitSha(sha)&&typeof commit?.message==='string'
+      ? [{sha,subject:redactCredentials(commit.message.split(/\r?\n/,1)[0]).slice(0,160),committedAt:timestamp(commit.committer?.date)}]:[])
+    : records<Issue>(body).flatMap(({number,title,pull_request})=>!pull_request&&typeof number==='number'
+      && Number.isSafeInteger(number)&&number>0&&typeof title==='string'
+      ? [{number,title:redactCredentials(title.slice(0,160))}]:[]);
+  return {items,more};
+}
+
 export async function syncRepository(repository: string, token: string, request = fetch, clock = new Date(), backfill = false): Promise<RepositorySnapshot> {
   const checkedAt = clock.toISOString();
   async function query(path: string): Promise<unknown> {
-    const response = await request('https://api.github.com/repos/' + repository + path, {
-      headers:{ Authorization:'Bearer ' + token, Accept:'application/vnd.github+json', 'X-GitHub-Api-Version':'2022-11-28' },
-      cache:'no-store', redirect:'error', signal:AbortSignal.timeout(8500),
-    });
-    if (!response.ok) {
-      const limited = response.status === 429 || (response.status === 403
-        && (response.headers.has('retry-after') || response.headers.get('x-ratelimit-remaining') === '0'));
-      throw new GitHubUnavailable(limited ? retryTime(response, clock.getTime()) : undefined);
-    }
-    return response.json();
+    return (await githubGet(repository,path,token,request,clock.getTime())).body;
   }
 
   async function activity<T>(path: string, params = '') {

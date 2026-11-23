@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, type FormEvent } from 'react';
+import { useEffect, useState, type FormEvent } from 'react';
 import { Plus } from 'lucide-react';
 import { convertAtRate, parseRate } from '@/lib/exchange-rate';
 import { dateLabel, newId } from '@/lib/format';
@@ -51,7 +51,8 @@ export function ExchangeRates({projectId}:{projectId:string}) {
   const {data}=useDemo();
   const [creating,setCreating]=useState(false);
   const [picked,setPicked]=useState('');
-  const [clock]=useState(()=>Date.now());
+  const [clock,setClock]=useState(()=>Date.now());
+  const [automatic,setAutomatic]=useState<{projectId:string;schedule:{status:string;lastSuccessfulAt:string|null}|null;quote:ExchangeRate|null}>();
   const [refreshing,setRefreshing]=useState(false);
   const [refreshError,setRefreshError]=useState('');
   async function refresh() {
@@ -65,8 +66,29 @@ export function ExchangeRates({projectId}:{projectId:string}) {
     finally {setRefreshing(false);}
   }
   const [draft,setDraft]=useState({quoteId:'',amount:''});
-  const quotes=data.exchangeRates.filter(quote=>!projectId||quote.projectId===projectId)
-    .sort((a,b)=>b.observedAt.localeCompare(a.observedAt));
+  useEffect(()=>{
+    if (!projectId) return;
+    const controller=new AbortController();
+    let timer:ReturnType<typeof setTimeout>|undefined;
+    async function refreshSchedule(){
+      try {
+        const response=await fetch('/api/exchange-rates/refresh?projectId='+encodeURIComponent(projectId),
+          {cache:'no-store',signal:controller.signal});
+        if (!response.ok) throw new Error('Schedule unavailable');
+        const payload=await response.json();
+        if (!controller.signal.aborted) {setAutomatic({...payload,projectId});setClock(Date.now());}
+      } catch {
+        if (!controller.signal.aborted) setAutomatic({projectId,schedule:{status:'unavailable',lastSuccessfulAt:null},quote:null});
+      } finally {if (!controller.signal.aborted) timer=setTimeout(refreshSchedule,30_000);}
+    }
+    void refreshSchedule();
+    return ()=>{controller.abort();clearTimeout(timer);};
+  },[projectId]);
+  const schedule=automatic?.projectId===projectId ? automatic.schedule : null;
+  const latest=automatic?.projectId===projectId ? automatic.quote : null;
+  const quotes=data.exchangeRates.filter(quote=>(!projectId||quote.projectId===projectId) && quote.id!==latest?.id);
+  if (latest) quotes.push(latest);
+  quotes.sort((a,b)=>b.observedAt.localeCompare(a.observedAt));
   const selected=quotes.find(quote=>quote.id===picked) ?? quotes[0];
   const amount=selected?.id===draft.quoteId ? draft.amount : '';
   const sourceAmount=selected?parseAmount(amount,selected.from):undefined;
@@ -76,6 +98,9 @@ export function ExchangeRates({projectId}:{projectId:string}) {
     <Panel title="تبدیل ارز با نرخ ثبت‌شده" action={data.users[0]?.role==='Owner'
       && <div className="control-group"><Button icon={Plus} onClick={()=>setCreating(true)}>ثبت نرخ تبدیل</Button>
         {projectId && <Button disabled={refreshing} onClick={refresh}>{refreshing?'در حال دریافت…':'دریافت USD به IRR'}</Button>}</div>}>
+      {schedule && <p aria-live="polite" className="muted">{schedule.status==='ok'?'دریافت دوره‌ای موفق':schedule.status==='disabled'?'دریافت دوره‌ای غیرفعال':schedule.status==='pending'?'در انتظار نخستین دریافت':'دریافت دوره‌ای فعلاً در دسترس نیست'}
+        {schedule.lastSuccessfulAt && <> · {dateLabel(schedule.lastSuccessfulAt,{dateStyle:'medium',timeStyle:'short'},data.preferences.zone)}</>}
+      </p>}
       {refreshError && <p className="form-error" role="alert">{refreshError}</p>}
       {selected ? <div className="form-stack">
         <Field label="نرخ ثبت‌شده"><select value={selected.id} onChange={event=>{setPicked(event.currentTarget.value);setDraft({quoteId:'',amount:''});}}>

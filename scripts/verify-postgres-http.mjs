@@ -1,6 +1,7 @@
-import { fork, execFileSync } from 'node:child_process';
+import { fork, execFile, execFileSync } from 'node:child_process';
 import { createHash, createHmac, randomBytes, randomUUID } from 'node:crypto';
 import { once } from 'node:events';
+import { promisify } from 'node:util';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -20,6 +21,7 @@ const scratch = await mkdtemp(join(tmpdir(),'projectos-pg-http-'));
 const admin = new pg.Client({connectionString:adminUrl.href});
 const setupToken = 'synthetic-runtime-test-bootstrap-token';
 let server, currencyMock, existed = false, roleCreated = false;
+const workerRoles=[];
 
 async function startServer(env, fixtureOrigin) {
   const code=fixtureOrigin ? `const origin=${JSON.stringify(fixtureOrigin)};
@@ -67,6 +69,8 @@ try {
     NODE_ENV:'production', PROJECTOS_DATABASE_URL:runtime.href, PROJECTOS_DB_PATH:join(scratch,'must-not-exist.sqlite'),
     PROJECTOS_DATABASE_MODE:'postgres', PROJECTOS_MFA_ENCRYPTION_KEY:randomBytes(32).toString('hex'),
     PROJECTOS_SETUP_TOKEN:setupToken, PROJECTOS_AI_ENABLED:'disabled', PROJECTOS_GITHUB_TOKEN:'',
+    PROJECTOS_SEMANTIC_ORIGIN:process.env.PROJECTOS_TEST_SEMANTIC_ORIGIN??'',
+    PROJECTOS_SEMANTIC_TOKEN:process.env.PROJECTOS_TEST_SEMANTIC_TOKEN??'',
   };
   execFileSync(process.execPath,[resolve('scripts/migrate-postgres.mjs')],{env,stdio:['ignore','ignore','pipe'],timeout:30_000});
   await admin.query(`CREATE ROLE "${runtimeRole}" LOGIN PASSWORD '${runtimePassword}'`);
@@ -136,11 +140,14 @@ try {
   const agentToken='synthetic-runtime-monitor-agent-fixture-only';
   const webhookSecret=randomBytes(32).toString('hex');
   let quoteRequests=0, providerCode=503;
+  const providerStamp=new Date(Date.now()-60_000).toISOString();
+  let offeredRate=12345.6789,offeredAt=providerStamp;
   currencyMock=await localProvider((request,response)=>{
     quoteRequests++;
     assert.equal(request.url,'/v3/latest?base_currency=USD&currencies=IRR');
     assert.equal(request.headers.apikey,'synthetic-gate-d-currency');
-    reply(response,providerCode,{meta:{last_updated_at:new Date(Date.now()-60_000).toISOString()},data:{IRR:{code:'IRR',value:12345.6789}}});
+    reply(response,providerCode,{meta:{last_updated_at:offeredAt},data:{IRR:{code:'IRR',value:offeredRate}}},
+      providerCode===429?{'Retry-After':'900'}:{});
   });
   appUrl=await startServer({...env, PROJECTOS_MONITOR_WORKSPACE:workspace,
     PROJECTOS_CURRENCYAPI_ENABLED:'enabled',PROJECTOS_CURRENCYAPI_KEY:'synthetic-gate-d-currency',
@@ -173,6 +180,77 @@ try {
   assert.equal(machineObservations[1].diskUsedBytes,null);
   assert.equal(machineObservations[1].diskTotalBytes,null);
   assert.equal((await fetch(appUrl+'/api/monitoring?resourceId=other-resource',{headers})).status,404);
+  const checkVpn=async()=> (await (await fetch(endpoint,{headers})).json()).vpn[0];
+  const vpnStamp=offset=>new Date(Date.parse(reading.observedAt)+offset).toISOString();
+  const vpnReading={...reading,observedAt:vpnStamp(-3000),vpn:{wireguardState:'observed',handshakeAt:vpnStamp(-5000),
+    serviceState:'ok',latencyMs:23}};
+  assert.equal((await observe({...vpnReading,vpn:{...vpnReading.vpn,latencyMs:-1}})).status,422);
+  assert.equal((await observe({...vpnReading,vpn:{...vpnReading.vpn,peerKey:'synthetic-sensitive'}})).status,422);
+  assert.deepEqual(await (await observe(vpnReading)).json(),{accepted:true});
+  assert.equal((await checkVpn()).state,'handshake_and_service');
+  const failedVpn={...vpnReading,observedAt:vpnStamp(-2500),vpn:{...vpnReading.vpn,serviceState:'timeout',latencyMs:null}};
+  assert.deepEqual(await (await observe(failedVpn)).json(),{accepted:true});
+  assert.equal((await checkVpn()).state,'handshake_only');
+  assert.equal((await checkVpn()).lastSuccessfulAt,vpnReading.observedAt);
+  assert.deepEqual(await (await observe({...vpnReading,observedAt:vpnStamp(-2000)})).json(),{accepted:true});
+  assert.equal((await checkVpn()).recovered,true);
+
+  const monitorRole=database.replace('projectos_test_','projectos_mon_');
+  const monitorPassword=randomBytes(24).toString('hex');
+  await admin.query(`CREATE ROLE "${monitorRole}" LOGIN PASSWORD '${monitorPassword}'`);
+  workerRoles.push(monitorRole);
+  execFileSync(psql,['-X','-h',adminUrl.hostname,'-p',adminUrl.port||'5432','-U',decodeURIComponent(adminUrl.username),
+    '-d',database,'-v','monitor_role='+monitorRole,'-v','workspace_id='+workspace,'-f',resolve('schema/postgres/grant-monitor.sql')],{
+    env:{...env,PGPASSWORD:decodeURIComponent(adminUrl.password)},stdio:['ignore','ignore','pipe'],timeout:30_000,
+  });
+  const monitorUrl=new URL(runtime);
+  monitorUrl.username=monitorRole;
+  monitorUrl.password=monitorPassword;
+  const lowMonitor=new pg.Client({connectionString:monitorUrl.href});
+  const parallelMonitor=new pg.Client({connectionString:monitorUrl.href});
+  const sloAdmin=new pg.Client({connectionString:runtime.href});
+  await Promise.all([lowMonitor.connect(),parallelMonitor.connect(),sloAdmin.connect()]);
+  try {
+    const reconcile=async (id=resource.id,client=lowMonitor)=>(await client.query(
+      "SELECT public.projectos_reconcile_slo($1,3,2,2,90,ARRAY['email']) AS state",[id])).rows[0].state;
+    let sampleTime=Date.now()-120_000;
+    const addSample=async (state,status)=>{
+      sampleTime+=1000;
+      await lowMonitor.query(`INSERT INTO monitor_observations(workspace_id,resource_id,checked_at,state,status_code,diagnostic,source)
+        VALUES($1,$2,$3,$4,$5,'fixture','https')`,[workspace,resource.id,new Date(sampleTime),state,status]);
+    };
+    const sample=async (state,status)=>{
+      await addSample(state,status);
+      return reconcile();
+    };
+    assert.equal(await reconcile('unassigned-resource'),null);
+    assert.equal(await sample('unknown',null),'insufficient_data');
+    assert.equal(await sample('healthy',200),'insufficient_data');
+    assert.equal(await sample('healthy',200),'insufficient_data');
+    assert.equal(await sample('healthy',200),'healthy');
+    for (let i=0;i<9;i++) assert.equal(await sample('healthy',200),'healthy');
+    assert.equal(await sample('unhealthy',503),'degraded');
+    await addSample('unhealthy',503);
+    assert.deepEqual(await Promise.all([reconcile(),reconcile(resource.id,parallelMonitor)]),['open','open']);
+    const outbox=()=>sloAdmin.query("SELECT id,state,channel FROM notification_outbox WHERE reminder_id LIKE 'slo:%' ORDER BY channel");
+    const {rows:queued}=await outbox();
+    assert.deepEqual(queued.map(row=>[row.channel,row.state]),[['email','pending'],['in_app','available']]);
+    await assert.rejects(lowMonitor.query('SELECT id FROM notification_outbox'),{code:'42501'});
+    assert.equal(await sample('healthy',200),'recovering');
+    assert.equal(await sample('unknown',null),'open');
+    assert.equal(await sample('healthy',200),'recovering');
+    assert.equal(await sample('healthy',200),'resolved');
+    assert.deepEqual((await outbox()).rows.map(row=>[row.channel,row.state]),[['email','cancelled'],['in_app','available']]);
+    const archived=await fetch(appUrl+'/api/records/incidents/'+queued[1].id,{headers});
+    assert.equal(archived.status,200);
+    const closed=(await archived.json()).record;
+    assert.equal(closed.state,'resolved');
+    assert.ok(closed.endedAt && closed.durationSeconds===4);
+    assert.equal((await (await fetch(endpoint,{headers})).json()).lifecycle[0].state,'resolved');
+    const delivery=await fetch(appUrl+'/api/notifications?alert='+queued[1].id,{headers});
+    assert.equal(delivery.status,200);
+    assert.equal((await delivery.json()).delivery.find(item=>item.channel==='email')?.status,'cancelled');
+  } finally {await Promise.all([lowMonitor.end(),parallelMonitor.end(),sloAdmin.end()]);}
   const viewer='runtime-viewer@example.test';
   const invitation=await fetch(appUrl+'/api/team/invitations',{method:'POST',headers,
     body:JSON.stringify({email:viewer,role:'viewer',projectIds:[otherProject.id]})});
@@ -200,6 +278,39 @@ try {
   assert.equal(visibleHistory.status,200);
   assert.equal((await visibleHistory.json()).versions.length,1);
   assert.equal(hiddenHistory.status,404);
+  const semantic=(body,session=headers,origin=appUrl)=>fetch(appUrl+'/api/assistant/semantic',{
+    method:'POST',headers:{...headers,...session,Origin:origin},body:JSON.stringify(body),signal:AbortSignal.timeout(30_000),
+  });
+  const q={action:'query',projectId:otherProject.id,question:'Synthetic history evidence'};
+  assert.equal((await semantic(q,viewerHeaders,'http://127.0.0.1:1')).status,403);
+  assert.equal((await semantic({...q,projectId:project.id},viewerHeaders)).status,404);
+  assert.equal((await semantic({action:'rebuild',projectId:otherProject.id},viewerHeaders)).status,403);
+  assert.equal((await semantic({...q,question:'api_key = synthetic-fixture-credential'})).status,422);
+  if (env.PROJECTOS_SEMANTIC_ORIGIN) {
+    const indexed=await semantic({action:'rebuild',projectId:otherProject.id});
+    assert.equal(indexed.status,200);
+    assert.equal((await indexed.json()).indexed,1);
+    const results=await semantic(q,viewerHeaders);
+    assert.equal(results.status,200);
+    const output=await results.json();
+    assert.equal(output.externalTransmission,false);
+    assert.equal(output.citations[0]?.href,'/docs?doc=doc-'+otherProject.id);
+    assert.deepEqual((await (await semantic({...q,question:'What tools are used to trim a bonsai tree?'},viewerHeaders)).json()).citations,[]);
+    const current=(await (await fetch(appUrl+'/api/state',{headers})).json()).version;
+    const updated={...revisions[1],action:'replace',record:{...revisions[1].record,revision:2,body:'Updated history.'}};
+    assert.equal((await fetch(appUrl+'/api/records',{headers,method:'PATCH',
+      body:JSON.stringify({version:current,changes:[updated]})})).status,200);
+    assert.deepEqual((await (await semantic(q,viewerHeaders)).json()).citations,[]);
+    const rebuilt=await semantic({action:'rebuild',projectId:otherProject.id});
+    assert.equal(rebuilt.status,200);
+    assert.equal((await rebuilt.json()).indexed,1);
+    const versionAfterEdit=(await (await fetch(appUrl+'/api/state',{headers})).json()).version;
+    assert.equal((await fetch(appUrl+'/api/records',{headers,method:'PATCH',body:JSON.stringify({
+      version:versionAfterEdit,changes:[{kind:'docs',id:updated.id,action:'delete'}],
+    })})).status,200);
+    assert.deepEqual((await (await semantic({...q,question:'Updated history.'},viewerHeaders)).json()).citations,[]);
+    console.log('Verified configured local semantic model over HTTP with authorization and stale-index invalidation');
+  }
   const memberEmail='runtime-editor@example.test';
   const editorInvite=await fetch(appUrl+'/api/team/invitations',{method:'POST',headers,
     body:JSON.stringify({email:memberEmail,role:'editor',projectIds:[otherProject.id]})});
@@ -290,6 +401,70 @@ try {
   assert.ok(quote.receivedAt>quote.observedAt);
   assert.deepEqual(await (await rateRefresh()).json(),quote);
   assert.equal(quoteRequests,2);
+  const rateRole=database.replace('projectos_test_','projectos_fx_');
+  const ratePassword=randomBytes(24).toString('hex');
+  await admin.query(`CREATE ROLE "${rateRole}" LOGIN PASSWORD '${ratePassword}'`);
+  workerRoles.push(rateRole);
+  execFileSync(psql,['-X','-h',adminUrl.hostname,'-p',adminUrl.port||'5432','-U',decodeURIComponent(adminUrl.username),
+    '-d',database,'-v','worker_role='+rateRole,'-v','workspace_id='+workspace,
+    '-v','project_ids='+JSON.stringify([otherProject.id]),'-v','interval_seconds=3600','-v','enabled=true',
+    '-f',resolve('schema/postgres/grant-currency-worker.sql')],{
+    env:{...env,PGPASSWORD:decodeURIComponent(adminUrl.password)},stdio:['ignore','ignore','pipe'],timeout:30_000,
+  });
+  const rateUrl=new URL(runtime);
+  rateUrl.username=rateRole;rateUrl.password=ratePassword;
+  const launchRate=()=>promisify(execFile)(process.execPath,['--input-type=module','-e',`
+    import {runCurrencyCycle} from './scripts/currency-rate-worker.mjs';
+    import {closeDatabase} from './scripts/database.mjs';
+    const [workspace,origin]=process.argv.slice(1);
+    if (!/^http:\\/\\/127[.]0[.]0[.]1:\\d+$/.test(origin)) throw new Error('Expected loopback fixture');
+    const request=(url,options)=>{
+      const target=new URL(url);
+      if (target.origin!=='https://api.currencyapi.com') throw new Error('Unexpected provider');
+      return fetch(origin+target.pathname+target.search,options);
+    };
+    try {console.log(await runCurrencyCycle(workspace,'synthetic-gate-d-currency',request));}
+    finally {await closeDatabase();}
+  `,workspace,currencyMock.origin],{env:{...env,PROJECTOS_DATABASE_URL:rateUrl.href},timeout:20_000}).then(r=>r.stdout.trim());
+  assert.deepEqual((await Promise.all([launchRate(),launchRate()])).sort(),['idle','ok']);
+  assert.equal(await launchRate(),'idle');
+  const scheduledPath=appUrl+'/api/exchange-rates/refresh?projectId=';
+  const scheduled=await (await fetch(scheduledPath+otherProject.id,{headers:viewerHeaders})).json();
+  assert.equal(scheduled.quote.rate,'12345.6789');
+  assert.equal(scheduled.schedule.status,'ok');
+  assert.equal((await fetch(scheduledPath+project.id,{headers:viewerHeaders})).status,404);
+  const dueClient=new pg.Client({connectionString:runtime.href});
+  await dueClient.connect();
+  try {
+    const due=()=>dueClient.query("UPDATE projectos_private.currency_schedules SET ready_at=now(),lease=gen_random_uuid(),lease_until=now()-interval '1 minute' WHERE workspace_id=$1",[workspace]);
+    await due();
+    providerCode=429;
+    assert.equal(await launchRate(),'rate_limited');
+    assert.equal(await launchRate(),'idle');
+    const failed=(await (await fetch(scheduledPath+otherProject.id,{headers:viewerHeaders})).json());
+    assert.deepEqual(failed.quote,scheduled.quote);
+    assert.equal(failed.schedule.status,'rate_limited');
+    await due();
+    providerCode=200;
+    offeredRate=-1;
+    assert.equal(await launchRate(),'unavailable');
+    offeredRate=12345.6789;
+    offeredAt=new Date(Date.now()-49*3600_000).toISOString();
+    await due();
+    assert.equal(await launchRate(),'unavailable');
+    assert.deepEqual((await (await fetch(scheduledPath+otherProject.id,{headers:viewerHeaders})).json()).quote,scheduled.quote);
+    offeredAt=providerStamp;
+    await due();
+    const beforeExhausted=quoteRequests;
+    await dueClient.query('UPDATE projectos_private.currency_schedules SET attempts=4 WHERE workspace_id=$1',[workspace]);
+    assert.equal(await launchRate(),'idle');
+    assert.equal(quoteRequests,beforeExhausted);
+    await due();
+    assert.equal(await launchRate(),'ok');
+    const settled=await dueClient.query("SELECT count(*)::int AS total FROM records WHERE workspace_id=$1 AND project_id=$2 AND kind='exchangeRates'",[workspace,otherProject.id]);
+    assert.equal(settled.rows[0].total,1);
+  } finally {await dueClient.end();}
+
   const stamp=new Date().toISOString();
   const manualRate={id:'manual-gate-d-rate',projectId:project.id,from:'USD',to:'IRR',source:'Fixture manual quote',
     rate:'50000.01',observedAt:stamp};
@@ -359,6 +534,79 @@ try {
   assert.deepEqual(await (await webhook()).json(),{accepted:0});
   const refreshed=await (await fetch(github+'?projectId='+otherProject.id,{headers:viewerHeaders})).json();
   assert.equal(refreshed.repositories[0].state,'pending_refresh');
+  const workerRole=database.replace('projectos_test_','projectos_gh_');
+  const workerPassword=randomBytes(24).toString('hex');
+  await admin.query(`CREATE ROLE "${workerRole}" LOGIN PASSWORD '${workerPassword}'`);
+  workerRoles.push(workerRole);
+  execFileSync(psql,['-X','-h',adminUrl.hostname,'-p',adminUrl.port||'5432','-U',decodeURIComponent(adminUrl.username),
+    '-d',database,'-v','worker_role='+workerRole,'-v','workspace_id='+workspace,'-v','project_id='+otherProject.id,
+    '-v','repository=fixture/second','-f',resolve('schema/postgres/grant-github-sync.sql')],{
+    env:{...env,PGPASSWORD:decodeURIComponent(adminUrl.password)},stdio:['ignore','ignore','pipe'],timeout:30_000,
+  });
+  const workerUrl=new URL(runtime);
+  workerUrl.username=workerRole;workerUrl.password=workerPassword;
+  const guestWorker=new pg.Client({connectionString:workerUrl.href});
+  await guestWorker.connect();
+  try {
+    await assert.rejects(guestWorker.query('SELECT payload FROM github_snapshots'),{code:'42501'});
+    assert.equal((await guestWorker.query('SELECT public.projectos_github_claim($1,$2,$3,$4) AS job',
+      [workspace,project.id,'fixture/first',randomUUID()])).rows[0].job,null);
+  } finally {await guestWorker.end();}
+
+  const requests=[];
+  let interrupted=true;
+  const githubMock=await localProvider((request,response)=>{
+    const url=new URL(request.url,'http://127.0.0.1');
+    const leaf=url.pathname.split('/').at(-1),page=Number(url.searchParams.get('page')??'1');
+    if (leaf==='second') return reply(response,200,{open_issues_count:5});
+    if (leaf==='commits' && url.searchParams.has('until')) {
+      requests.push('commits:'+page);
+      if (page===2 && interrupted) return response.destroy();
+      reply(response,200,[{sha:'a'.repeat(40),commit:{message:'Synthetic commit'}},
+        {sha:(page===1?'b':'c').repeat(40),commit:{message:'Verified backfill'}}],
+      page===1?{Link:'<https://api.github.com/repos/fixture/second/commits?page=2>; rel="next"'}:{});
+    } else if (leaf==='issues') {
+      reply(response,200,[{number:1,title:'Synthetic issue'},{number:page+1,title:'Page issue'}],
+        page===1?{Link:'<https://api.github.com/repos/fixture/second/issues?page=2>; rel="next"'}:{});
+    } else reply(response,200,[]);
+  });
+  const runGitHub=(limit)=>promisify(execFile)(process.execPath,['--input-type=module','-e',`
+    import {runGitHubSync} from './scripts/github-sync-worker.mjs';
+    import {closeDatabase} from './scripts/database.mjs';
+    const [binding,origin,limit]=process.argv.slice(1);
+    if (!/^http:\\/\\/127[.]0[.]0[.]1:\\d+$/.test(origin)) throw new Error('Expected loopback fixture');
+    const request=(url,options)=>{
+      const target=new URL(url);
+      if (target.origin!=='https://api.github.com') throw new Error('Unexpected provider');
+      return fetch(origin+target.pathname+target.search,options);
+    };
+    try {console.log(JSON.stringify(await runGitHubSync([JSON.parse(binding)],'synthetic-github-worker', {request,limit:Number(limit)})));}
+    finally {await closeDatabase();}
+  `,JSON.stringify({workspaceId:workspace,projectId:otherProject.id,repository:'fixture/second'}),githubMock.origin,String(limit)],{
+    env:{...env,PROJECTOS_DATABASE_URL:workerUrl.href},timeout:25_000,
+  }).then(result=>JSON.parse(result.stdout));
+  try {
+    const racing=await Promise.all([runGitHub(1),runGitHub(1)]);
+    // A racing worker may claim the next committed stage, but it cannot repeat it.
+    assert.ok(racing.reduce((count,result)=>count+result.processed,0)>=1);
+    await runGitHub(10);
+    const pending=(await (await fetch(github+'?projectId='+otherProject.id,{headers:viewerHeaders})).json()).repositories[0];
+    assert.deepEqual(pending.job,{stage:'commits',page:2,state:'backoff',error:'provider'});
+    assert.equal(pending.commits[0].subject,'Verified scoped sample');
+    const controller=new pg.Client({connectionString:runtime.href});
+    await controller.connect();
+    try {await controller.query('UPDATE projectos_private.github_sync_jobs SET ready_at=now() WHERE workspace_id=$1',[workspace]);}
+    finally {await controller.end();}
+    interrupted=false;
+    assert.equal((await runGitHub(10)).completed,1);
+    assert.deepEqual(requests,['commits:1','commits:2','commits:2']);
+    const after=(await (await fetch(github+'?projectId='+otherProject.id,{headers:viewerHeaders})).json()).repositories[0];
+    assert.equal(after.job.state,'completed');
+    assert.equal(after.commits.length,3);
+    assert.equal(after.issues.length,3);
+    assert.equal((await fetch(github+'?projectId='+project.id,{headers:viewerHeaders})).status,404);
+  } finally {await githubMock.close();}
+
   const disposable={...otherProject,id:'disposable-project',status:'archived'};
   assert.equal((await commit([{kind:'projects',id:disposable.id,action:'create',record:disposable}])).status,200);
   assert.equal((await commit([{kind:'projects',id:disposable.id,action:'delete'}])).status,200);
@@ -401,6 +649,7 @@ try {
   assert.equal((await changeGrant(editorAccount.id,[project.id],editorHeaders)).status,403);
   assert.equal((await changeGrant(viewerAccount.id,[project.id],viewerHeaders)).status,403);
   assert.equal((await changeGrant(editorAccount.id,[project.id])).status,200);
+  assert.equal((await semantic(q,editorHeaders)).status,404);
   assert.equal((await fetch(appUrl+'/api/records/tasks/'+editorTask.id,{headers:editorHeaders})).status,404);
   assert.equal((await fetch(appUrl+'/api/records/tasks/'+privateTask.id,{headers:editorHeaders})).status,200);
   assert.equal((await fetch(appUrl+'/api/team/members/'+editorAccount.id,{method:'DELETE',headers})).status,200);
@@ -417,6 +666,9 @@ try {
   const restarted=await fetch(appUrl+'/api/records/tasks/'+task.id,{headers});
   assert.equal(restarted.status,200);
   assert.equal((await restarted.json()).record.title,checkpoint.title);
+  const persistedMonitoring=await (await fetch(appUrl+'/api/monitoring?resourceId='+resource.id,{headers})).json();
+  assert.equal(persistedMonitoring.lifecycle[0].state,'resolved');
+  assert.equal(persistedMonitoring.vpn[0].lastSuccessfulAt,vpnStamp(-2000));
   assert.equal((await fetch(appUrl+'/api/state',{headers:editorHeaders})).status,401);
   await stopServer();
   appUrl=await startServer({...env,PROJECTOS_DATABASE_URL:''});
@@ -434,6 +686,7 @@ try {
   await stopServer();
   await currencyMock?.close();
   if (existed) await admin.query('DROP DATABASE "' + database + '"');
+  for (const role of workerRoles) await admin.query('DROP ROLE "'+role+'"');
   if (roleCreated) await admin.query('DROP ROLE "' + runtimeRole + '"');
   await admin.end();
   await rm(scratch,{recursive:true,force:true,maxRetries:4});

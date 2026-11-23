@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { cpus, freemem, totalmem } from 'node:os';
 import { statfs } from 'node:fs/promises';
+import { localTunnelService,wireGuardEvidence } from './vpn-evidence.mjs';
 import { setTimeout } from 'node:timers/promises';
 
 function captureCpu() {
@@ -37,10 +38,12 @@ try {
   const cpuPercent = Math.max(0,Math.min(100,(1-(after.idle-before.idle)/elapsed)*100));
   const totalBytes = totalmem();
   const disk=await captureDisk(process.env.PROJECTOS_AGENT_DISK_PATH);
+  const iface=process.env.PROJECTOS_AGENT_WIREGUARD_INTERFACE;
+  const vpn=iface ? {...await wireGuardEvidence(iface),...await localTunnelService(process.env.PROJECTOS_AGENT_VPN_HEALTH_URL)} : undefined;
   const result = await fetch(endpoint,{
     method:'POST',redirect:'error',signal:AbortSignal.timeout(7000),
     headers:{'Content-Type':'application/json',Authorization:'Bearer '+token},
-    body:JSON.stringify({ resourceId,cpuPercent,totalBytes,usedBytes:totalBytes-freemem(),...disk,observedAt:new Date().toISOString() }),
+    body:JSON.stringify({ resourceId,cpuPercent,totalBytes,usedBytes:totalBytes-freemem(),...disk,vpn,observedAt:new Date().toISOString() }),
   });
   if (!result.ok) throw new Error('Observation rejected');
   console.log('Authenticated machine observation submitted');

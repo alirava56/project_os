@@ -169,9 +169,18 @@ export async function verifyRollbackBoundary(pool, expected) {
   try {
     await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');
     await client.query('SET LOCAL row_security=off');
-    const known = [...tables.map(table => table.name), 'sqlite_imports', 'projectos_schema_migrations'];
+    const postgresOnly = ['public.vpn_observations', 'public.semantic_index', 'projectos_private.github_sync_bindings',
+      'projectos_private.github_sync_jobs', 'projectos_private.currency_schedules', 'projectos_private.slo_lifecycle'];
+    const known = [...tables.map(table => table.name), 'sqlite_imports', 'projectos_schema_migrations',
+      ...postgresOnly.filter(name => name.startsWith('public.')).map(name => name.split('.')[1])];
     const extra = await client.query(`SELECT 1 FROM pg_tables WHERE schemaname='public'
       AND NOT (tablename = ANY($1::text[])) LIMIT 1`, [known]);
+    for (const name of postgresOnly) {
+      const { rows } = await client.query('SELECT to_regclass($1) AS name', [name]);
+      if (rows[0].name && (await client.query('SELECT 1 FROM ' + name + ' LIMIT 1')).rowCount) {
+        throw new SourceError('Unsafe SQLite rollback: target contains PostgreSQL-only data');
+      }
+    }
     const recorded = await client.query('SELECT 1 FROM sqlite_imports WHERE source_digest=$1', [expected.digest]);
     if (extra.rowCount || !recorded.rowCount || (await targetManifest(client)).digest !== expected.digest) {
       throw new SourceError('Unsafe SQLite rollback: target differs from the imported snapshot');

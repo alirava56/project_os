@@ -78,6 +78,8 @@ export interface Incident {
   date: string;
   state: 'open' | 'acknowledged' | 'snoozed' | 'resolved' | 'dismissed';
   snoozedUntil?: string;
+  endedAt?: string;
+  durationSeconds?: number;
 }
 export interface Expense {
   id: string;

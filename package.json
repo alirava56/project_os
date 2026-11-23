@@ -23,6 +23,8 @@
     "test:core": "node --test scripts/core.test.cjs scripts/gate-c.test.mjs",
     "test:restore": "node scripts/restore-dry-run.mjs",
     "test:security": "node --test scripts/core.test.cjs",
+    "currency:worker": "node scripts/currency-rate-worker.mjs",
+    "github:worker": "node scripts/github-sync-worker.mjs",
     "workers:local": "node scripts/local-workers.mjs",
     "worker:optional": "node scripts/worker-optional.mjs",
     "security:scan-legacy": "node scripts/sanitize-legacy-secrets.cjs",

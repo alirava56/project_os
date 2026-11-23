@@ -176,6 +176,15 @@ test('SQLite to PostgreSQL preserves data and identity; transactional rollback, 
     assert.throws(blockedSource,/SQLite is sealed for PostgreSQL cutover/);
     const rollbackCheck=()=>run('migrate-sqlite-postgres.mjs','--source',sqlitePath,'--check-rollback','--backup',legacyBackup);
     assert.equal(JSON.parse(rollbackCheck()).status,'matches_imported_snapshot');
+    const localEvidence=new Client({connectionString:connectionFor(target)});
+    await localEvidence.connect();
+    try {
+      await localEvidence.query(`INSERT INTO projectos_private.slo_lifecycle(workspace_id,resource_id,state,last_checked)
+        SELECT id,'rollback-fixture','insufficient_data',now() FROM workspaces`);
+      assert.throws(rollbackCheck,/PostgreSQL-only data/);
+      await localEvidence.query("DELETE FROM projectos_private.slo_lifecycle WHERE resource_id='rollback-fixture'");
+      assert.equal(JSON.parse(rollbackCheck()).status,'matches_imported_snapshot');
+    } finally {await localEvidence.end();}
     assert.equal(JSON.parse(run('migrate-sqlite-postgres.mjs','--source',sqlitePath,'--apply','--backup',legacyBackup)).status, 'already_imported');
     assert.equal(JSON.parse(run('migrate-sqlite-postgres.mjs','--source',sqlitePath,'--dry-run')).digest, plan.digest);
 

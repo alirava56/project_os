@@ -37,4 +37,9 @@ SELECT projectos_private.grant_record_projection(:'runtime_role');
 GRANT EXECUTE ON FUNCTION public.projectos_notification_status(text), public.projectos_notification_health(),
   public.projectos_retire_explicit_reminder(text) TO :"runtime_role";
 
+GRANT EXECUTE ON FUNCTION public.projectos_github_job_status(text,text) TO :"runtime_role";
+GRANT EXECUTE ON FUNCTION public.projectos_currency_status(text) TO :"runtime_role";
+GRANT EXECUTE ON FUNCTION public.projectos_slo_status() TO :"runtime_role";
+GRANT SELECT,INSERT ON public.vpn_observations TO :"runtime_role";
+GRANT SELECT,INSERT,UPDATE ON public.semantic_index TO :"runtime_role";
 COMMIT;

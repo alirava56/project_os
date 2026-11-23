@@ -10,6 +10,9 @@ const states: Record<RepositorySnapshot['state'], string> = {
   connected:'دریافت موفق', unknown:'نامشخص', stale:'دادهٔ قدیمی',
   rate_limited:'محدودیت نرخ', pending_refresh:'در انتظار همگام‌سازی',
 };
+const jobLabels:Record<string,string>={pending:'در صف',running:'در حال پردازش',backoff:'در انتظار تلاش مجدد',
+  completed:'همگام‌سازی خودکار کامل شد',failed:'همگام‌سازی خودکار ناموفق'};
+const phaseLabels:Record<string,string>={overview:'خلاصهٔ مخزن',commits:'Commitها',issues:'Issueها'};
 const pullStates={open:'باز',closed:'بسته',merged:'ادغام‌شده'};
 function time(value: string | null | undefined) {
   return value && Number.isFinite(Date.parse(value))
@@ -20,13 +23,17 @@ export function ProjectGitHub({ projectId }: { projectId: string }) {
   const [repositories,setRepositories]=useState<ProjectRepository[] | null>();
   useEffect(()=>{
     const controller=new AbortController();
-    fetch('/api/integrations/github?projectId='+encodeURIComponent(projectId),{cache:'no-store',signal:controller.signal})
+    let timer:ReturnType<typeof setTimeout> | undefined;
+    const refresh=()=>fetch('/api/integrations/github?projectId='+encodeURIComponent(projectId),{cache:'no-store',signal:controller.signal})
       .then(async response=>{
         if(!response.ok) throw new Error('GitHub data unavailable');
         const payload=await response.json() as {repositories:ProjectRepository[]};
         if(!controller.signal.aborted) setRepositories(payload.repositories);
-      }).catch(()=>{if(!controller.signal.aborted) setRepositories(null);});
-    return ()=>controller.abort();
+      }).catch(()=>{if(!controller.signal.aborted) setRepositories(null);}).finally(()=>{
+        if(!controller.signal.aborted) timer=setTimeout(refresh,15_000);
+      });
+    void refresh();
+    return ()=>{controller.abort();clearTimeout(timer);};
   },[projectId]);
 
   return <Panel title="فعالیت GitHub">
@@ -42,6 +49,10 @@ export function ProjectGitHub({ projectId }: { projectId: string }) {
         <small className="muted">آخرین بررسی API · {time(repo.checkedAt)}</small>
         {repo.state!=='connected' && repo.lastSuccessfulAt && <small className="muted">آخرین دادهٔ موفق · {time(repo.lastSuccessfulAt)}</small>}
       </div>
+      {repo.job && <p className="muted" aria-live="polite">{jobLabels[repo.job.state]}
+        {['running','pending','backoff'].includes(repo.job.state) && <> · {phaseLabels[repo.job.stage]} · صفحهٔ {repo.job.page}</>}
+        {repo.job.error==='rate_limited' && <> · محدودیت نرخ</>}
+      </p>}
       {!!repo.commits?.length && <details><summary>Commitها</summary><ul>{repo.commits.map(commit=>
         <li key={commit.sha}><bdi>{commit.subject}</bdi> · <bdi dir="ltr">{commit.sha.slice(0,8)}</bdi> · {time(commit.committedAt)}</li>
       )}</ul></details>}

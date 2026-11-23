@@ -524,7 +524,43 @@ test('Gate D displays persisted contract balances, allocated cost and sampled av
   const at=new Date(Math.floor(Date.now()/900_000)*900_000-900_000).toISOString();
   await postgresFixture.query(`INSERT INTO monitor_observations(workspace_id,resource_id,checked_at,state,status_code,latency_ms,diagnostic,source)
     SELECT id,$1,$2,'healthy',200,12,'Synthetic HTTPS','https' FROM workspaces`,[resource.id,at]);
+  const key=process.env.PROJECTOS_TEST_TLS_KEY, cert=process.env.PROJECTOS_TEST_TLS_CERT;
+  if (!key || !cert) throw new Error('The VPN contract requires the generated loopback TLS fixture');
+  let healthStatus=204;
+  const vpn=createServer({key:await readFile(key),cert:await readFile(cert)},(req,res)=>{
+    res.writeHead(req.method==='HEAD' && req.url==='/health'?healthStatus:405).end();
+  });
+  vpn.listen(0,'127.0.0.1');
+  await once(vpn,'listening');
+  const address=vpn.address();
+  if (!address || typeof address==='string') throw new Error('Missing VPN service fixture');
+  const check=async()=>{
+    const {stdout}=await promisify(execFile)(process.execPath,['--input-type=module','-e',
+      "import {localTunnelService} from './scripts/vpn-evidence.mjs'; console.log(JSON.stringify(await localTunnelService(process.argv[1])));",
+      `https://127.0.0.1:${address.port}/health`],{env:{...process.env,NODE_EXTRA_CA_CERTS:cert},timeout:8000});
+    return JSON.parse(stdout) as {serviceState:string;latencyMs:number | null};
+  };
+  try {
+    const probe=await check();
+    expect(probe.serviceState).toBe('ok');
+    expect(probe.latencyMs).toEqual(expect.any(Number));
+    const checkedAt=new Date(Date.now()-1000);
+    await postgresFixture.query(`INSERT INTO vpn_observations(workspace_id,resource_id,checked_at,handshake_at,wireguard_state,service_state,latency_ms)
+      SELECT id,$1,$2,$3,'observed',$4,$5 FROM workspaces`,[resource.id,checkedAt,new Date(checkedAt.getTime()-1000),probe.serviceState,probe.latencyMs]);
+    healthStatus=200;
+    expect(await check()).toEqual({serviceState:'unexpected',latencyMs:null});
+  } finally {
+    vpn.closeAllConnections();
+    await new Promise<void>(done=>vpn.close(()=>done()));
+  }
+  expect(await check()).toEqual({serviceState:'connection',latencyMs:null});
   await page.goto('/monitoring');
   await expect(page.getByText('پوشش ناکافی برای ارزیابی بودجه',{exact:false})).toBeVisible();
+  await expect(page.getByText('دست‌دهی تازه و پاسخ سرویس محلی',{exact:true})).toBeVisible();
+  await page.route('**/api/integrations/github?projectId='+project.id,route=>route.fulfill({json:{repositories:[{
+    repository:'fixture/gate-d',state:'pending_refresh',checkedAt:null,job:{state:'backoff',stage:'commits',page:2,error:'rate_limited'},
+  }]}}));
+  await page.goto('/projects/'+project.id);
+  await expect(page.getByText(/در انتظار تلاش مجدد.*صفحهٔ 2.*محدودیت نرخ/)).toBeVisible();
   await expect(page.locator('html')).toHaveAttribute('dir','rtl');
 });

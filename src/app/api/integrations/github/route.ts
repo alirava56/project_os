@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { checkOrigin, getCurrentAccount, rateLimit, readLimitedJson } from '@/lib/server/auth';
 import { canSeeProject, projectPolicy, sql, loadRecord, readTransaction, transaction, type Account } from '@/lib/server/db';
 import { apiError, jsonError, noStore } from '@/lib/server/http';
-import { githubBindings, retainRepositorySnapshot, syncRepository, type RepositoryBinding, type RepositorySnapshot } from '@/lib/server/github';
+import { githubBindings, retainRepositorySnapshot, syncRepository, type JobProgress, type RepositoryBinding, type RepositorySnapshot } from '@/lib/server/github';
 import { validRecordId } from '@/lib/record-contract';
 
 export const runtime = 'nodejs';
@@ -12,13 +12,17 @@ function bindings(account: Account) {
   return githubBindings().filter(binding => binding.workspaceId === account.workspaceId);
 }
 async function snapshot(account: Account, binding: RepositoryBinding) {
-  const row = await readTransaction(async db => {
+  const {row,job} = await readTransaction(async db => {
     await projectPolicy(db, account);
-    return db.one<{status:string;payload:string}>(`SELECT status,payload FROM github_snapshots WHERE workspace_id=?
-      AND project_id=? AND repo=?`, binding.workspaceId, binding.projectId, binding.repository);
+    const row=await db.one<{status:string;payload:string}>(`SELECT status,payload FROM github_snapshots WHERE workspace_id=?
+      AND project_id=? AND repo=?`,binding.workspaceId,binding.projectId,binding.repository);
+    const progress=db.scopeIdentity && await db.one<{job:JobProgress|null}>(
+      'SELECT public.projectos_github_job_status(?,?) AS job',binding.projectId,binding.repository);
+    return {row,job:progress ? progress.job ?? undefined : undefined};
   });
-  if (!row) return;
-  return {...JSON.parse(row.payload) as RepositorySnapshot, repository:binding.repository, state:row.status as RepositorySnapshot['state']};
+  if (!row) return job ? {repository:binding.repository,state:'pending_refresh' as const,checkedAt:'',job} : undefined;
+  return {...JSON.parse(row.payload) as RepositorySnapshot,repository:binding.repository,
+    state:row.status as RepositorySnapshot['state'],job};
 }
 
 export async function GET(request: NextRequest) {

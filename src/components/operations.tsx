@@ -5,6 +5,7 @@ import { Activity, Bell, Check, CircleAlert, Clock3, Radio, RefreshCw } from 'lu
 import { afterHours, dateLabel, matches, number, resourceHref } from '@/lib/format';
 import { choices, incidentStates, priorities, priorityTones } from '@/lib/labels';
 import { machineObservationFresh, type MachineObservation } from '@/lib/monitoring';
+import { vpnState,type vpnSummary } from '@/lib/vpn-observation';
 import { availabilityTarget, type sampledAvailability } from '@/lib/slo';
 import { savePreferences, useDemo } from '@/lib/store';
 import type { Incident } from '@/lib/types';
@@ -16,7 +17,9 @@ export function Monitoring() {
   const { data }=useDemo();
   const [query,setQuery]=useState('');
   const [observations,setObservations]=useState<Array<{resourceId:string;checkedAt:string;state:string;statusCode:number|null;latencyMs:number|null;tlsExpiresAt:string|null;diagnostic:string|null}>>([]);
+  const [vpn,setVpn]=useState<ReturnType<typeof vpnSummary>>([]);
   const [machine,setMachine]=useState<MachineObservation[]>([]);
+  const [lifecycle,setLifecycle]=useState<Array<{resourceId:string;state:string;lastChecked:string}>>([]);
   const [availability,setAvailability]=useState<ReturnType<typeof sampledAvailability>>([]);
   const [monitorStatus,setMonitorStatus]=useState<'loading'|'not_configured'|'configured'|'error'>('loading');
   const [requestCycle,setRequestCycle]=useState(0);
@@ -31,6 +34,8 @@ export function Monitoring() {
       setObservations(Array.isArray(payload.observations)?payload.observations:[]);
       setMachine(Array.isArray(payload.machineObservations)?payload.machineObservations:[]);
       setAvailability(Array.isArray(payload.availability)?payload.availability:[]);
+      setLifecycle(Array.isArray(payload.lifecycle)?payload.lifecycle:[]);
+      setVpn(Array.isArray(payload.vpn)?payload.vpn:[]);
       setMonitorStatus(payload.status==='configured'?'configured':'not_configured');
     }).catch(()=>{if(!cancelled)setMonitorStatus('error');});
     return ()=>{cancelled=true;};
@@ -46,6 +51,9 @@ export function Monitoring() {
     const observation=latest.get(id);
     return observation&&Number.isFinite(Date.parse(observation.checkedAt))&&clock-Date.parse(observation.checkedAt)>=-60_000&&clock-Date.parse(observation.checkedAt)<=15*60*1000&&observation.state!=='stale'?observation:undefined;
   };
+  const vpnLabels:Record<string,string>={stale:'مشاهدهٔ قدیمی',unknown:'نامشخص',service_only:'پاسخ سرویس بدون دست‌دهی تازه',
+    handshake_stale:'دست‌دهی تازه ثبت نشده',handshake_only:'دست‌دهی تازه، پاسخ سرویس تأیید نشده',handshake_and_service:'دست‌دهی تازه و پاسخ سرویس محلی'};
+  const stages:Record<string,string>={healthy:'پایدار',degraded:'افت کیفیت',open:'اختلال باز',recovering:'در حال بازیابی',resolved:'بازیابی شد',insufficient_data:'نمونهٔ ناکافی'};
   const diagnosticLabels:Record<string,string>={dns:'خطای DNS',tls:'خطای TLS',timeout:'مهلت پاسخ تمام شد',connection:'خطای اتصال',unavailable:'بررسی ناموفق'};
   const stateLabel=(state:string)=>({healthy:'HTTPS پاسخ‌گو',unhealthy:'HTTPS ناموفق',stale:'مشاهدهٔ قدیمی'}[state] ?? 'وضعیت نامشخص');
   const unknown=data.resources.filter(r=>!fresh(r.id)).length;
@@ -92,6 +100,10 @@ export function Monitoring() {
           )}</Pill>}/>)}</div>:
         <Empty title="در این بازه مشاهده‌ای ثبت نشده است"/>}</Panel>
       <Panel title="دسترس‌پذیری نمونه‌برداری‌شده و بودجهٔ خطا">
+        {lifecycle.map(item=><Row key={item.resourceId} icon={Activity}
+          title={data.resources.find(resource=>resource.id===item.resourceId)?.name??'منبع'}
+          meta={dateLabel(item.lastChecked,{dateStyle:'short',timeStyle:'short'})}
+          end={<Pill>{clock-Date.parse(item.lastChecked)>15*60_000?'مرحلهٔ ثبت‌شده قدیمی است':stages[item.state]??'نامشخص'}</Pill>}/>)}
         <p className="muted">هدف {number(availabilityTarget)}٪ در ۲۴ ساعت گذشته. پوشش با بازه‌های ۱۵ دقیقه‌ای سنجیده می‌شود.</p>
         {monitorStatus==='configured' && availability.length ? availability.map(item=><Row key={item.resourceId} icon={Activity}
           title={data.resources.find(resource=>resource.id===item.resourceId)?.name ?? 'منبع'}
@@ -100,6 +112,20 @@ export function Monitoring() {
             {number(item.availability)}٪ · {item.covered===item.expected
               ? number(item.errorBudgetRemaining)+' بازه بودجهٔ باقی‌مانده' : 'پوشش ناکافی برای ارزیابی بودجه'}
           </Pill>}/>) : <Empty title={monitorStatus==='loading'?'در حال دریافت مشاهدات':'مشاهدهٔ معتبر برای محاسبه ثبت نشده است'}/>}
+      </Panel>
+      <Panel title="شواهد پایش VPN">
+        {monitorStatus==='configured' && vpn.length ? vpn.map(item=><Row key={item.resourceId} icon={Radio}
+          title={data.resources.find(resource=>resource.id===item.resourceId)?.name??'منبع'}
+          meta={<>{dateLabel(item.checkedAt,{dateStyle:'short',timeStyle:'short'})}
+            {item.latencyMs!==null && <> · پاسخ محلی {number(item.latencyMs)} میلی‌ثانیه</>}
+            {item.recovered && <> · بازیابی مشاهده شد</>}
+            {item.consecutiveWithoutBoth>0 && <> · {number(item.consecutiveWithoutBoth)} مشاهدهٔ متوالی بدون هر دو شاهد</>}
+            {item.lastSuccessfulAt && <> · آخرین مشاهدهٔ کامل {dateLabel(item.lastSuccessfulAt,{dateStyle:'short',timeStyle:'short'})}</>}
+            {diagnosticLabels[item.serviceState] && <> · {diagnosticLabels[item.serviceState]}</>}
+            {' · وضعیت مسیر تونل نامشخص'}
+          </>}
+          end={<Pill>{vpnLabels[vpnState(item,clock)]}</Pill>}/>)
+          : <Empty title={monitorStatus==='loading'?'در حال دریافت شواهد VPN':'گزارش VPN ثبت نشده است'}/>}
       </Panel>
       <Panel title="آخرین گزارش‌های عامل میزبان">
         {machine.length?machine.slice(0,10).map(o=><Row key={o.resourceId+o.checkedAt} icon={Activity}
@@ -116,7 +142,7 @@ export function Monitoring() {
 
 const rules = [
   { key:'renewal',title:'یادآوری تمدید سرور',detail:'پیش از سررسید زیرساخت'},
-  { key:'outage',title:'هشدار قطعی سرویس',detail:'ترجیح نمایشی برای پایش آینده'},
+  { key:'outage',title:'هشدار قطعی سرویس',detail:'ثبت اختلال هنگام عبور از آستانهٔ پایش پیکربندی‌شده'},
   { key:'stale',title:'وظایف بدون فعالیت',detail:'پس از ۷ روز'},
   { key:'digest',title:'خلاصه روزانه',detail:'ترجیح نمایشی فضای کاری'},
 ] as const;
@@ -186,6 +212,8 @@ export function Alerts() {
       <Row icon={Bell} title={alert.title} meta={<>{projectName(data,alert.projectId)} · {alert.source}</>} end={<Pill tone={priorityTones[alert.priority]}>{priorities[alert.priority]}</Pill>} />
       <p className="muted">وضعیت: {incidentStates[alert.state]}{alert.snoozedUntil && ` · تا ${dateLabel(alert.snoozedUntil,{day:'numeric',month:'long',hour:'2-digit',minute:'2-digit'},data.preferences.zone)}`}</p>
       {/^(auto|monitor)-[a-f0-9]{28}$/.test(alert.id) && <NotificationStatus key={alert.id} alert={alert.id} zone={data.preferences.zone} />}
+      {alert.endedAt && <p className="muted">پایان اختلال · {dateLabel(alert.endedAt,{dateStyle:'short',timeStyle:'short'},data.preferences.zone)}
+        {alert.durationSeconds!==undefined && <> · {number(alert.durationSeconds)} ثانیه</>}</p>}
       {alertError && <p className="form-error" role="alert">{alertError}</p>}
       <div className="form-actions">{alert.state !== 'resolved' && alert.state !== 'dismissed' && <>
         {alert.state !== 'acknowledged' && <Button disabled={saving} onClick={() => updateState('acknowledged')}>ثبت رسیدگی</Button>}

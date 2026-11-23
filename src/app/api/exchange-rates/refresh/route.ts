@@ -1,13 +1,33 @@
 import { createHash } from 'node:crypto';
 import { NextRequest, NextResponse } from 'next/server';
 import { checkOrigin,getCurrentAccount,rateLimit,readLimitedJson } from '@/lib/server/auth';
-import { loadRecord,loadState } from '@/lib/server/db';
+import { loadRecord,loadState,projectPolicy,readTransaction,recordReadTable,storedRecord } from '@/lib/server/db';
 import { invalidRecordBody,recordError,recordFailure,recordHeaders } from '@/lib/server/record-http';
 import { commitRecordChanges } from '@/lib/server/record-service';
 import { getUsdIrr,providerName,quoteMaxAge } from '@/lib/server/currency-provider';
 import { validRecordId } from '@/lib/record-contract';
 
 export const runtime='nodejs';
+
+export async function GET(request:NextRequest) {
+  const account=await getCurrentAccount();
+  if (!account) return recordError('Unauthenticated',401);
+  const project=request.nextUrl.searchParams.get('projectId');
+  if (!validRecordId(project)) return recordError('Invalid project',422);
+  try {
+    const result=await readTransaction(async db=>{
+      const policy=await projectPolicy(db,account);
+      if ((policy.projectIds && !policy.projectIds.has(project)) || !await storedRecord(db,account.workspaceId,'projects',project)) return;
+      const status=db.scopeIdentity ? (await db.one<{info:unknown}>(
+        'SELECT public.projectos_currency_status(?) AS info',project))?.info : null;
+      const jsonSource=db.dialect==='postgres'?"payload::jsonb->>'source'":"json_extract(payload,'$.source')";
+      const row=await db.one<{payload:string}>(`SELECT payload FROM ${recordReadTable(db)} WHERE workspace_id=? AND project_id=?
+        AND kind='exchangeRates' AND ${jsonSource}='currencyapi' ORDER BY updated_at DESC,id LIMIT 1`,account.workspaceId,project);
+      return {schedule:status??null,quote:row ? JSON.parse(row.payload) : null};
+    });
+    return result ? NextResponse.json(result,{headers:recordHeaders}) : recordError('Not found',404);
+  } catch (error) {return recordFailure(error);}
+}
 
 export async function POST(request:NextRequest) {
   if (!checkOrigin(request)) return recordError('Origin rejected',403);
