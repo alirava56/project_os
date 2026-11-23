@@ -6,6 +6,8 @@ ProjectOS یک فضای کاری فارسی و راست‌چین برای تیم
 
 **وضعیت فعلی: پیش‌نمایش خصوصی.** راه‌اندازی محلی با دادهٔ آزمایشی مسیر پیشنهادی است. کارکرد اتصال‌ها به پیکربندی سرویس‌ها وابسته است و انتشار Production به تأیید جداگانه در محیط هدف نیاز دارد.
 
+راهنمای اجرا، فهرست امکانات و تصویرهای زیر مربوط به نسخهٔ پیش‌نمایش در شاخهٔ `production/gate-b-runtime-role` هستند. [مشاهدهٔ شاخهٔ پیش‌نمایش](https://github.com/alirava56/project_os/tree/production/gate-b-runtime-role)
+
 [امکانات](#features) · [تصاویر رابط](#screenshots) · [شروع سریع](#quickstart) · [PostgreSQL](#postgresql) · [آزمون‌ها](#testing) · [مستندات و مجوز](#documentation)
 
 <a name="screenshots"></a>
@@ -15,9 +17,6 @@ ProjectOS یک فضای کاری فارسی و راست‌چین برای تیم
 تصویرها از برنامهٔ در حال اجرا، در یک فضای کاری با پروژه‌ها و داده‌های ساختگی گرفته شده‌اند.
 
 ![داشبورد فارسی ProjectOS با خلاصهٔ پروژه‌ها، وظایف و وضعیت پایش](docs/images/readme/dashboard.png)
-
-<details>
-<summary><strong>جزئیات پروژه، برد وظایف و صفحهٔ مالی</strong></summary>
 
 ### جزئیات پروژه
 
@@ -31,14 +30,9 @@ ProjectOS یک فضای کاری فارسی و راست‌چین برای تیم
 
 ![صفحهٔ مالی ProjectOS با خلاصهٔ هزینه‌ها، فیلترها و نمودارهای مالی](docs/images/readme/finance.png)
 
-</details>
-
-<details>
-<summary><strong>داشبورد در موبایل</strong></summary>
+### داشبورد در موبایل
 
 <img src="docs/images/readme/mobile.png" width="320" alt="نمای موبایل داشبورد فارسی ProjectOS با کارت‌های پروژه و نوار جهت‌یابی پایین صفحه">
-
-</details>
 
 <a name="features"></a>
 
@@ -109,7 +103,7 @@ npm run dev -- --hostname 127.0.0.1
 | ارجاع Vault | نشانی HTTPS، مسیرهای مجاز KV v2 و توکن خواندن فراداده روی سرور. |
 | جست‌وجوی معنایی | PostgreSQL، سرویس محلی E5 Base و ساخت نمایه به‌وسیلهٔ مالک پروژه. وزن‌های مدل خارج از مخزن نگهداری می‌شوند. |
 
-تنظیمات، نقش‌های Worker و شیوهٔ اجرای مدل در [راهنمای سرویس‌های Gate D](docs/operations/GATE-D-WORKERS-FA.md) و [راهنمای اتصال‌ها](docs/operations/INTEGRATIONS-FA.md) آمده‌اند.
+تنظیمات، نقش‌های Worker و شیوهٔ اجرای مدل در [راهنمای سرویس‌های Gate D در شاخهٔ پیش‌نمایش](https://github.com/alirava56/project_os/blob/production/gate-b-runtime-role/docs/operations/GATE-D-WORKERS-FA.md) و [راهنمای اتصال‌ها](docs/operations/INTEGRATIONS-FA.md) آمده‌اند.
 
 <a name="testing"></a>
 
