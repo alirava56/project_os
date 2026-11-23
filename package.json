@@ -1,6 +1,7 @@
 {
   "name": "projectos",
   "version": "1.0.0",
+  "license": "MIT",
   "description": "ProjectOS private developer workspace (local persistence preview)",
   "scripts": {
     "dev": "next dev",
